@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.1"
+SCRIPT_VERSION = "1.8.0"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -58,6 +58,113 @@ SCRIPT_CAPABILITIES = [
     "delete_clip",
     "clear_notes_from_clip",
 ]
+
+# ── Note validation (pure; no Live dependency so it can be unit-tested) ──────
+
+# Defaults for fields a note dict may omit. release_velocity 64 is the MIDI
+# standard "no release velocity" value and what Live itself writes.
+NOTE_DEFAULTS = {
+    "start_time": 0.0,
+    "duration": 0.25,
+    "velocity": 100.0,
+    "mute": False,
+    "probability": 1.0,
+    "velocity_deviation": 0.0,
+    "release_velocity": 64.0,
+}
+
+# Fields that only the modern add_new_notes API can store; the legacy
+# set_notes tuple carries pitch/start/duration/velocity/mute only.
+EXTENDED_NOTE_FIELDS = ("probability", "velocity_deviation", "release_velocity")
+
+
+def _is_number(value):
+    # bool is an int subclass; True as a velocity is a caller bug, not 1.
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def normalize_note_specs(notes):
+    """Validate note dicts and fill defaults.
+
+    Returns a list of dicts with exactly the keys pitch, start_time, duration,
+    velocity, mute, probability, velocity_deviation, release_velocity.
+    Unknown keys (e.g. note_id from get_clip_notes) are ignored.
+
+    Raises ValueError naming the first offending note and field. Out-of-range
+    values are rejected, never clamped: a silently corrected note is exactly
+    the kind of agent/UI mismatch this is meant to prevent.
+    """
+    if not isinstance(notes, (list, tuple)):
+        raise ValueError("notes must be a list of note objects")
+
+    def fail(i, msg):
+        raise ValueError("Invalid note at index %d: %s" % (i, msg))
+
+    def number(i, note, key, lo=None, hi=None, lo_open=False):
+        value = note.get(key, NOTE_DEFAULTS.get(key))
+        if not _is_number(value):
+            fail(i, "%s must be a number, got %r" % (key, value))
+        value = float(value)
+        if value != value or value in (float("inf"), float("-inf")):
+            fail(i, "%s must be finite, got %r" % (key, value))
+        if lo is not None and (value <= lo if lo_open else value < lo):
+            fail(i, "%s must be %s %s, got %r"
+                 % (key, ">" if lo_open else ">=", lo, note.get(key)))
+        if hi is not None and value > hi:
+            fail(i, "%s must be <= %s, got %r" % (key, hi, note.get(key)))
+        return value
+
+    result = []
+    for i, note in enumerate(notes):
+        if not isinstance(note, dict):
+            fail(i, "expected an object, got %r" % (note,))
+        if "pitch" not in note:
+            fail(i, "pitch is required")
+        pitch = note["pitch"]
+        if not _is_number(pitch) or float(pitch) != int(pitch):
+            fail(i, "pitch must be an integer, got %r" % (pitch,))
+        pitch = int(pitch)
+        if pitch < 0 or pitch > 127:
+            fail(i, "pitch must be in 0..127, got %d" % pitch)
+
+        mute = note.get("mute", NOTE_DEFAULTS["mute"])
+        if isinstance(mute, bool):
+            pass
+        elif _is_number(mute) and mute in (0, 1):
+            mute = bool(mute)
+        else:
+            fail(i, "mute must be a boolean, got %r" % (mute,))
+
+        result.append({
+            "pitch": pitch,
+            "start_time": number(i, note, "start_time"),
+            "duration": number(i, note, "duration", lo=0.0, lo_open=True),
+            "velocity": number(i, note, "velocity", lo=1, hi=127),
+            "mute": mute,
+            "probability": number(i, note, "probability", lo=0, hi=1),
+            "velocity_deviation": number(i, note, "velocity_deviation", lo=-127, hi=127),
+            "release_velocity": number(i, note, "release_velocity", lo=0, hi=127),
+        })
+    return result
+
+
+def extended_fields_in(notes):
+    """Extended field names the caller set explicitly on any note."""
+    present = set()
+    for note in notes:
+        if isinstance(note, dict):
+            for key in EXTENDED_NOTE_FIELDS:
+                if key in note:
+                    present.add(key)
+    return sorted(present)
+
+
+def step_sequencer_error(midi_clip_type):
+    kind = ("a Step Sequencer clip" if midi_clip_type == 1
+            else "not a standard MIDI clip")
+    return ("Clip is %s (midi_clip_type=%s); notes written via the Live API "
+            "are stored invisibly (not shown or played). Convert the clip to "
+            "MIDI first." % (kind, midi_clip_type))
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -580,7 +687,8 @@ class AbletonMCP(ControlSurface):
                         "name": clip.name,
                         "length": clip.length,
                         "is_playing": clip.is_playing,
-                        "is_recording": clip.is_recording
+                        "is_recording": clip.is_recording,
+                        "midi_clip_type": self._midi_clip_type(clip),
                     }
                 
                 clip_slots.append({
@@ -788,24 +896,45 @@ class AbletonMCP(ControlSurface):
                 raise Exception("No clip in slot")
             
             clip = clip_slot.clip
-            
-            # Convert note data to Live's format
-            live_notes = []
-            for note in notes:
-                pitch = note.get("pitch", 60)
-                start_time = note.get("start_time", 0.0)
-                duration = note.get("duration", 0.25)
-                velocity = note.get("velocity", 100)
-                mute = note.get("mute", False)
-                
-                live_notes.append((pitch, start_time, duration, velocity, mute))
-            
-            # Add the notes
-            clip.set_notes(tuple(live_notes))
-            
+
+            if not getattr(clip, "is_midi_clip", False):
+                raise Exception("Clip is not a MIDI clip")
+
+            # Refuse before touching the clip: notes written into a Step
+            # Sequencer clip are accepted and read back but never shown/played.
+            midi_clip_type = self._midi_clip_type(clip)
+            if midi_clip_type:
+                raise Exception(step_sequencer_error(midi_clip_type))
+
+            # Validate everything first so a bad note leaves the clip untouched.
+            specs = normalize_note_specs(notes)
+
+            try:
+                import Live
+                Spec = Live.Clip.MidiNoteSpecification
+            except Exception:
+                Spec = None
+
+            ignored_fields = []
+            if Spec is not None and hasattr(clip, "add_new_notes"):
+                clip.add_new_notes(tuple(Spec(**s) for s in specs))
+                api_used = "add_new_notes"
+            else:
+                # Pre-Live-11 fallback: the tuple format has no slot for the
+                # extended fields, so report which ones were dropped.
+                clip.set_notes(tuple(
+                    (s["pitch"], s["start_time"], s["duration"],
+                     s["velocity"], s["mute"]) for s in specs))
+                api_used = "set_notes"
+                ignored_fields = extended_fields_in(notes)
+
             result = {
-                "note_count": len(notes)
+                "note_count": len(specs),
+                "api_used": api_used,
+                "midi_clip_type": midi_clip_type,
             }
+            if ignored_fields:
+                result["ignored_fields"] = ignored_fields
             return result
         except Exception as e:
             self.log_message("Error adding notes to clip: " + str(e))
@@ -1059,6 +1188,10 @@ class AbletonMCP(ControlSurface):
 
             if not clip.is_midi_clip:
                 raise Exception("Clip is not a MIDI clip; no notes to clear")
+
+            midi_clip_type = self._midi_clip_type(clip)
+            if midi_clip_type:
+                raise Exception(step_sequencer_error(midi_clip_type))
 
             length = clip.length
 
@@ -1841,6 +1974,38 @@ class AbletonMCP(ControlSurface):
         except Exception:
             return default
 
+    def _midi_clip_type(self, clip):
+        """Live 13's Clip.midi_clip_type (0 = piano roll, 1 = Step Sequencer).
+
+        None when the attribute does not exist (Live <= 12) or the clip is not
+        a MIDI clip, so older Live versions behave exactly as before.
+        """
+        if not getattr(clip, "is_midi_clip", False):
+            return None
+        try:
+            value = getattr(clip, "midi_clip_type")
+        except Exception:
+            return None
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    def _is_non_standard_midi_clip(self, clip):
+        """True for any MIDI clip that is not a plain piano-roll clip.
+
+        Checked as != 0 rather than == 1: other values may exist and none of
+        them is known to show API-written notes.
+        """
+        return bool(self._midi_clip_type(clip))
+
+    def _clip_type_info(self, clip):
+        """Fields that tell a reader whether the returned notes are trustworthy."""
+        return {
+            "midi_clip_type": self._midi_clip_type(clip),
+            "notes_may_not_match_ui": self._is_non_standard_midi_clip(clip),
+        }
+
     def _notes_from_clip(self, clip):
         """Extract MIDI notes from a clip (incl. MPE/expression when available)."""
         notes = []
@@ -2071,6 +2236,8 @@ class AbletonMCP(ControlSurface):
             "color": int(getattr(clip, "color", 0)),
         }
         info.update(self._serialize_clip_common(clip))
+        if info["is_midi_clip"]:
+            info.update(self._clip_type_info(clip))
         if include_notes and info["is_midi_clip"]:
             info["notes"] = self._notes_from_clip(clip)
             info["note_count"] = len(info["notes"])
@@ -2088,6 +2255,8 @@ class AbletonMCP(ControlSurface):
             "is_playing": bool(getattr(clip, "is_playing", False)),
         }
         info.update(self._serialize_clip_common(clip))
+        if info["is_midi_clip"]:
+            info.update(self._clip_type_info(clip))
         if include_notes and info["is_midi_clip"]:
             info["notes"] = self._notes_from_clip(clip)
             info["note_count"] = len(info["notes"])
@@ -2186,7 +2355,7 @@ class AbletonMCP(ControlSurface):
             if not getattr(clip, "is_midi_clip", False):
                 raise Exception("Clip is not a MIDI clip")
             notes = self._notes_from_clip(clip)
-            return {
+            result = {
                 "track_index": track_index,
                 "clip_index": clip_index,
                 "clip_name": clip.name,
@@ -2194,6 +2363,8 @@ class AbletonMCP(ControlSurface):
                 "note_count": len(notes),
                 "notes": notes,
             }
+            result.update(self._clip_type_info(clip))
+            return result
         except Exception as e:
             self.log_message("Error getting clip notes: " + str(e))
             raise
