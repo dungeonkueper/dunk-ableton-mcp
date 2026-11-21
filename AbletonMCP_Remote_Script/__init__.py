@@ -83,6 +83,11 @@ def _is_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _is_finite(value):
+    value = float(value)
+    return value == value and value not in (float("inf"), float("-inf"))
+
+
 def normalize_note_specs(notes):
     """Validate note dicts and fill defaults.
 
@@ -104,9 +109,9 @@ def normalize_note_specs(notes):
         value = note.get(key, NOTE_DEFAULTS.get(key))
         if not _is_number(value):
             fail(i, "%s must be a number, got %r" % (key, value))
-        value = float(value)
-        if value != value or value in (float("inf"), float("-inf")):
+        if not _is_finite(value):
             fail(i, "%s must be finite, got %r" % (key, value))
+        value = float(value)
         if lo is not None and (value <= lo if lo_open else value < lo):
             fail(i, "%s must be %s %s, got %r"
                  % (key, ">" if lo_open else ">=", lo, note.get(key)))
@@ -121,7 +126,10 @@ def normalize_note_specs(notes):
         if "pitch" not in note:
             fail(i, "pitch is required")
         pitch = note["pitch"]
-        if not _is_number(pitch) or float(pitch) != int(pitch):
+        # Finite check first: int() raises its own ValueError/OverflowError on
+        # NaN/inf, which would lose the note index and field name.
+        if (not _is_number(pitch) or not _is_finite(pitch)
+                or float(pitch) != int(pitch)):
             fail(i, "pitch must be an integer, got %r" % (pitch,))
         pitch = int(pitch)
         if pitch < 0 or pitch > 127:
