@@ -86,6 +86,10 @@ def test_boundary_values_are_accepted(rs):
     ({"pitch": float("-inf")}, "pitch"),
     ({"pitch": 60, "velocity": float("inf")}, "velocity"),
     ({"pitch": 60, "probability": float("nan")}, "probability"),
+    ({"pitch": 10 ** 400}, "pitch"),
+    ({"pitch": 10 ** 5000}, "pitch"),  # repr() itself fails on 3.11+
+    ({"pitch": 60, "start_time": 10 ** 400}, "start_time"),
+    ({"pitch": 60, "velocity": -10 ** 400}, "velocity"),
     ({"pitch": 60, "velocity": 0}, "velocity"),
     ({"pitch": 60, "velocity": 128}, "velocity"),
     ({"pitch": 60, "probability": 1.1}, "probability"),
@@ -154,6 +158,28 @@ class FakeClip(object):
 
     def remove_notes_extended(self, *args):
         self.notes = []
+
+
+class BrokenTypeClip(FakeClip):
+    """Live 13 clip whose midi_clip_type exists but cannot be read."""
+
+    @property
+    def midi_clip_type(self):
+        raise RuntimeError("boom")
+
+
+class WeirdTypeClip(FakeClip):
+    def __init__(self, value):
+        FakeClip.__init__(self)
+        self._value = value
+
+    @property
+    def midi_clip_type(self):
+        return self._value
+
+
+class IntLikeEnum(int):
+    """Stand-in for a Boost.Python enum value."""
 
 
 class FakeSlot(object):
@@ -358,3 +384,60 @@ def test_script_error_keeps_connection_and_message():
 
 def test_script_and_server_versions_match(rs):
     assert rs.SCRIPT_VERSION == EXPECTED_REMOTE_SCRIPT_VERSION == "1.8.0"
+
+
+# --------------------------------------------------------------------------
+# Fail-closed clip type detection
+# --------------------------------------------------------------------------
+
+def _seed(rs, clip):
+    clip.notes = [dict(rs.normalize_note_specs([{"pitch": 60}])[0])]
+
+
+@pytest.mark.parametrize("clip_factory", [
+    lambda: BrokenTypeClip(),
+    lambda: WeirdTypeClip("step"),
+    lambda: WeirdTypeClip(None),
+    lambda: WeirdTypeClip(1.5),
+    lambda: WeirdTypeClip(True),
+])
+def test_unreadable_clip_type_blocks_writes(rs, fake_live, clip_factory):
+    clip = clip_factory()
+    script = make_script(rs, clip)
+    with pytest.raises(Exception, match="Refusing to modify notes"):
+        script._add_notes_to_clip(0, 0, [NOTE])
+    assert clip.notes == [] and clip.legacy_writes == []
+    _seed(rs, clip)
+    with pytest.raises(Exception, match="Refusing to modify notes"):
+        script._clear_notes_from_clip(0, 0)
+    assert len(clip.notes) == 1
+
+
+def test_unreadable_clip_type_is_flagged_by_readers_not_raised(rs):
+    clip = BrokenTypeClip()
+    script = make_script(rs, clip)
+    read = script._get_clip_notes(0, 0)
+    assert read["midi_clip_type"] is None
+    assert read["notes_may_not_match_ui"] is True
+    assert "boom" in read["midi_clip_type_error"]
+    ser = script._serialize_session_clip(clip)
+    assert ser["notes_may_not_match_ui"] is True
+    slot = script._get_track_info(0)["clip_slots"][0]["clip"]
+    assert slot["midi_clip_type"] is None
+    assert "boom" in slot["midi_clip_type_error"]
+
+
+def test_int_like_enum_clip_type_is_accepted(rs, fake_live):
+    clip = WeirdTypeClip(IntLikeEnum(0))
+    result = make_script(rs, clip)._add_notes_to_clip(0, 0, [NOTE])
+    assert result["midi_clip_type"] == 0
+    clip = WeirdTypeClip(IntLikeEnum(1))
+    with pytest.raises(Exception, match="Step Sequencer"):
+        make_script(rs, clip)._add_notes_to_clip(0, 0, [NOTE])
+
+
+def test_missing_property_still_means_live12_normal_clip(rs, fake_live):
+    clip = FakeClip()  # no midi_clip_type attribute at all
+    result = make_script(rs, clip)._add_notes_to_clip(0, 0, [NOTE])
+    assert result["midi_clip_type"] is None
+    assert len(clip.notes) == 1

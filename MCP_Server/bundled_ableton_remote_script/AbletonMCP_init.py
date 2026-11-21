@@ -84,8 +84,24 @@ def _is_number(value):
 
 
 def _is_finite(value):
-    value = float(value)
+    """False for NaN, +/-inf, and ints too large to convert to float."""
+    try:
+        value = float(value)
+    except OverflowError:
+        return False
     return value == value and value not in (float("inf"), float("-inf"))
+
+
+def _short_repr(value, limit=40):
+    """repr() for error messages that cannot itself fail or flood the log.
+
+    Python 3.11+ refuses to repr ints with more than ~4300 digits.
+    """
+    try:
+        text = repr(value)
+    except Exception:
+        return "<%s too large to display>" % type(value).__name__
+    return text if len(text) <= limit else text[:limit] + "..."
 
 
 def normalize_note_specs(notes):
@@ -108,32 +124,34 @@ def normalize_note_specs(notes):
     def number(i, note, key, lo=None, hi=None, lo_open=False):
         value = note.get(key, NOTE_DEFAULTS.get(key))
         if not _is_number(value):
-            fail(i, "%s must be a number, got %r" % (key, value))
+            fail(i, "%s must be a number, got %s" % (key, _short_repr(value)))
         if not _is_finite(value):
-            fail(i, "%s must be finite, got %r" % (key, value))
+            fail(i, "%s must be a finite number, got %s" % (key, _short_repr(value)))
         value = float(value)
         if lo is not None and (value <= lo if lo_open else value < lo):
-            fail(i, "%s must be %s %s, got %r"
-                 % (key, ">" if lo_open else ">=", lo, note.get(key)))
+            fail(i, "%s must be %s %s, got %s"
+                 % (key, ">" if lo_open else ">=", lo, _short_repr(note.get(key))))
         if hi is not None and value > hi:
-            fail(i, "%s must be <= %s, got %r" % (key, hi, note.get(key)))
+            fail(i, "%s must be <= %s, got %s" % (key, hi, _short_repr(note.get(key))))
         return value
 
     result = []
     for i, note in enumerate(notes):
         if not isinstance(note, dict):
-            fail(i, "expected an object, got %r" % (note,))
+            fail(i, "expected an object, got %s" % _short_repr(note))
         if "pitch" not in note:
             fail(i, "pitch is required")
         pitch = note["pitch"]
-        # Finite check first: int() raises its own ValueError/OverflowError on
-        # NaN/inf, which would lose the note index and field name.
-        if (not _is_number(pitch) or not _is_finite(pitch)
-                or float(pitch) != int(pitch)):
-            fail(i, "pitch must be an integer, got %r" % (pitch,))
+        # Ints need no conversion (a huge one simply fails the range check).
+        # Floats are checked for finiteness before int(): int() raises its own
+        # ValueError/OverflowError on NaN/inf, losing the index and field name.
+        if not _is_number(pitch) or (
+                isinstance(pitch, float)
+                and (not _is_finite(pitch) or pitch != int(pitch))):
+            fail(i, "pitch must be an integer, got %s" % _short_repr(pitch))
         pitch = int(pitch)
         if pitch < 0 or pitch > 127:
-            fail(i, "pitch must be in 0..127, got %d" % pitch)
+            fail(i, "pitch must be in 0..127, got %s" % _short_repr(pitch))
 
         mute = note.get("mute", NOTE_DEFAULTS["mute"])
         if isinstance(mute, bool):
@@ -141,7 +159,7 @@ def normalize_note_specs(notes):
         elif _is_number(mute) and mute in (0, 1):
             mute = bool(mute)
         else:
-            fail(i, "mute must be a boolean, got %r" % (mute,))
+            fail(i, "mute must be a boolean, got %s" % _short_repr(mute))
 
         result.append({
             "pitch": pitch,
@@ -696,8 +714,11 @@ class AbletonMCP(ControlSurface):
                         "length": clip.length,
                         "is_playing": clip.is_playing,
                         "is_recording": clip.is_recording,
-                        "midi_clip_type": self._midi_clip_type(clip),
                     }
+                    type_info = self._clip_type_info(clip)
+                    clip_info["midi_clip_type"] = type_info["midi_clip_type"]
+                    if "midi_clip_type_error" in type_info:
+                        clip_info["midi_clip_type_error"] = type_info["midi_clip_type_error"]
                 
                 clip_slots.append({
                     "index": slot_index,
@@ -910,9 +931,7 @@ class AbletonMCP(ControlSurface):
 
             # Refuse before touching the clip: notes written into a Step
             # Sequencer clip are accepted and read back but never shown/played.
-            midi_clip_type = self._midi_clip_type(clip)
-            if midi_clip_type:
-                raise Exception(step_sequencer_error(midi_clip_type))
+            midi_clip_type = self._checked_midi_clip_type_for_write(clip)
 
             # Validate everything first so a bad note leaves the clip untouched.
             specs = normalize_note_specs(notes)
@@ -1197,9 +1216,7 @@ class AbletonMCP(ControlSurface):
             if not clip.is_midi_clip:
                 raise Exception("Clip is not a MIDI clip; no notes to clear")
 
-            midi_clip_type = self._midi_clip_type(clip)
-            if midi_clip_type:
-                raise Exception(step_sequencer_error(midi_clip_type))
+            self._checked_midi_clip_type_for_write(clip)
 
             length = clip.length
 
@@ -1985,33 +2002,75 @@ class AbletonMCP(ControlSurface):
     def _midi_clip_type(self, clip):
         """Live 13's Clip.midi_clip_type (0 = piano roll, 1 = Step Sequencer).
 
-        None when the attribute does not exist (Live <= 12) or the clip is not
-        a MIDI clip, so older Live versions behave exactly as before.
+        None only when the clip is not a MIDI clip or the property does not
+        exist (AttributeError: Live <= 12), so older Live behaves as before.
+
+        Fails closed otherwise: if the property exists but cannot be read, or
+        holds something that is not an integer, this raises rather than
+        returning None. None means "normal MIDI clip" to the write guard, and
+        Live silently accepts invisible notes in Step Sequencer clips, so an
+        unreadable type must never be mistaken for a safe one.
         """
         if not getattr(clip, "is_midi_clip", False):
             return None
         try:
-            value = getattr(clip, "midi_clip_type")
-        except Exception:
+            value = clip.midi_clip_type
+        except AttributeError:
             return None
+        except Exception as e:
+            raise Exception("Could not read midi_clip_type: %s" % e)
+        if isinstance(value, bool):
+            raise Exception("Unexpected midi_clip_type value: %s" % _short_repr(value))
         try:
-            return int(value)
+            as_int = int(value)
         except Exception:
-            return None
+            raise Exception("Unexpected midi_clip_type value: %s" % _short_repr(value))
+        # Only a float can be non-integral; an int-like enum (as Boost.Python
+        # exposes Live enums) must pass even if it does not compare equal.
+        if isinstance(value, float) and as_int != value:
+            raise Exception("Unexpected midi_clip_type value: %s" % _short_repr(value))
+        return as_int
+
+    def _checked_midi_clip_type_for_write(self, clip):
+        """Return the clip type, refusing anything but a plain MIDI clip."""
+        try:
+            midi_clip_type = self._midi_clip_type(clip)
+        except Exception as e:
+            raise Exception(
+                "Refusing to modify notes: cannot determine whether this is a "
+                "Step Sequencer clip (%s). Notes written to a Step Sequencer "
+                "clip are stored invisibly." % e)
+        if midi_clip_type:
+            raise Exception(step_sequencer_error(midi_clip_type))
+        return midi_clip_type
 
     def _is_non_standard_midi_clip(self, clip):
         """True for any MIDI clip that is not a plain piano-roll clip.
 
         Checked as != 0 rather than == 1: other values may exist and none of
-        them is known to show API-written notes.
+        them is known to show API-written notes. Raises when the type cannot
+        be determined (see _midi_clip_type).
         """
         return bool(self._midi_clip_type(clip))
 
     def _clip_type_info(self, clip):
-        """Fields that tell a reader whether the returned notes are trustworthy."""
+        """Fields that tell a reader whether the returned notes are trustworthy.
+
+        Readers must not fail a whole track or snapshot over one clip, so an
+        unreadable type is reported instead of raised, and it counts as
+        "may not match the UI".
+        """
+        try:
+            midi_clip_type = self._midi_clip_type(clip)
+        except Exception as e:
+            return {
+                "midi_clip_type": None,
+                "midi_clip_type_error": str(e),
+                "notes_may_not_match_ui": True,
+            }
         return {
-            "midi_clip_type": self._midi_clip_type(clip),
-            "notes_may_not_match_ui": self._is_non_standard_midi_clip(clip),
+            "midi_clip_type": midi_clip_type,
+            "notes_may_not_match_ui": bool(midi_clip_type),
         }
 
     def _notes_from_clip(self, clip):

@@ -476,7 +476,9 @@ def get_track_info(ctx: Context, track_index: int, user_prompt: str = "") -> str
     clip (piano roll), 1 = Step Sequencer clip, null = not a MIDI clip or a
     Live version without the attribute. Check it before writing notes:
     add_notes_to_clip and clear_notes_from_clip refuse any clip whose
-    midi_clip_type is not 0/null.
+    midi_clip_type is not 0/null. If the type exists but cannot be read,
+    midi_clip_type is null and midi_clip_type_error explains why; writes to
+    such a clip are refused too.
 
     Parameters:
     - track_index: The index of the track to get information about
@@ -512,6 +514,8 @@ def get_clip_notes(
     Step Sequencer clip) the returned notes are NOT what the user sees or hears:
     the API cannot read the clip's steps, and any notes listed were stored
     invisibly. Do not reason about the clip's musical content from them.
+    It is also true, with midi_clip_type_error set, when the clip type could
+    not be determined.
 
     Parameters:
     - track_index: Track that owns the clip
@@ -793,8 +797,8 @@ def add_notes_to_clip(
     values fail the whole call; nothing is clamped and nothing is written.
 
     Fails with an error (and leaves the clip unchanged) when the clip is a
-    Live 13 Step Sequencer clip (midi_clip_type != 0): Live accepts such notes
-    but never shows or plays them. The user must convert the clip to MIDI
+    Live 13 Step Sequencer clip (midi_clip_type != 0), or when its type cannot
+    be determined: Live accepts such notes but never shows or plays them. The user must convert the clip to MIDI
     first. get_track_info shows each clip's midi_clip_type.
 
     The result reports api_used: "add_new_notes" (all fields stored) or
@@ -856,7 +860,7 @@ def clear_notes_from_clip(
     add_notes_to_clip the edited notes.
 
     Fails with an error (and leaves the clip unchanged) for a Live 13 Step
-    Sequencer clip (midi_clip_type != 0).
+    Sequencer clip (midi_clip_type != 0) or a clip whose type cannot be read.
 
     Parameters:
     - track_index: The index of the track containing the clip
