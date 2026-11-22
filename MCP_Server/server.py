@@ -128,7 +128,8 @@ class AbletonConnection:
             # Arrangement view commands
             "switch_to_arrangement_view", "set_current_song_time",
             "duplicate_session_clip_to_arrangement",
-            "create_locator"
+            "create_locator",
+            "create_return_track", "set_send",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -692,6 +693,99 @@ def create_audio_track(ctx: Context, index: int = -1, user_prompt: str = "") -> 
     except Exception as e:
         logger.error(f"Error creating audio track: {str(e)}")
         return f"Error creating audio track: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("create_return_track")
+@trajectory_tool("create_return_track")
+def create_return_track(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Create a new return track (Live API: Song.create_return_track()).
+
+    Like the Live API this takes no index: the return track is appended after
+    the existing ones, and every track gets a new send for it at the end of
+    its send list. The send index to use with set_send equals the new return
+    track's index (send A = 0, send B = 1, ...).
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("create_return_track")
+        if missing:
+            raise ToolError(missing)
+        ableton = get_ableton_connection()
+        result = ableton.send_command("create_return_track", {})
+        return (
+            f"Created return track '{result.get('name', 'unknown')}' "
+            f"(return index {result.get('index')}, use send_index "
+            f"{result.get('send_index')} with set_send)"
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating return track: {str(e)}")
+        raise ToolError(f"Error creating return track: {str(e)}") from e
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_send")
+@trajectory_tool("set_send")
+def set_send(
+    ctx: Context,
+    track_index: int,
+    send_index: int,
+    value: float,
+    track_type: str = "track",
+    user_prompt: str = "",
+) -> str:
+    """
+    Set a send level (Live API: track.mixer_device.sends[send_index].value).
+
+    send_index addresses the return track the send feeds: 0 = send A /
+    first return track, 1 = send B, and so on (see return_track_count in
+    get_session_info, or the "sends" list in get_session_snapshot).
+
+    Parameters:
+    - track_index: Index into Song.tracks, or into Song.return_tracks when
+      track_type is "return"
+    - send_index: Index into the track's sends (= return track index)
+    - value: Send level in Live's parameter units, 0.0 (-inf dB) to 1.0
+      (0 dB). Out-of-range values are rejected, not clamped.
+    - track_type: "track" (default) for a regular track, "return" to set a
+      return track's send to another return track
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("set_send")
+        if missing:
+            raise ToolError(missing)
+        ableton = get_ableton_connection()
+        result = ableton.send_command(
+            "set_send",
+            {
+                "track_index": track_index,
+                "send_index": send_index,
+                "value": value,
+                "track_type": track_type,
+            },
+        )
+        target = result.get("return_track_name") or result.get(
+            "send_name", f"send {send_index}")
+        return (
+            f"Set send '{result.get('send_name', send_index)}' on "
+            f"'{result.get('track_name', track_index)}' → '{target}': "
+            f"{result.get('old_value')} → {result.get('value')}"
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        logger.error(f"Error setting send: {str(e)}")
+        raise ToolError(f"Error setting send: {str(e)}") from e
 
 
 @mcp.tool()

@@ -255,6 +255,7 @@ Once the config file has been set on Claude, and the remote script is running in
 - Load instruments and effects from Ableton's browser
 - Add notes to MIDI clips
 - Change tempo and other session parameters
+- Create return tracks and set send levels
 
 ### Example Commands
 
