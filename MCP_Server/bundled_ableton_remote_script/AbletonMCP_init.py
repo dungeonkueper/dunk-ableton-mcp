@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.8.0"
+SCRIPT_VERSION = "1.9.0"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -57,6 +57,8 @@ SCRIPT_CAPABILITIES = [
     "create_locator",
     "delete_clip",
     "clear_notes_from_clip",
+    "create_return_track",
+    "set_send",
 ]
 
 # ── Note validation (pure; no Live dependency so it can be unit-tested) ──────
@@ -433,7 +435,8 @@ class AbletonMCP(ControlSurface):
                                  "switch_to_arrangement_view", "set_current_song_time",
                                  "duplicate_session_clip_to_arrangement",
                                  "map_rack_magnitude", "inspect_rack",
-                                 "create_locator"]:
+                                 "create_locator",
+                                 "create_return_track", "set_send"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -533,6 +536,15 @@ class AbletonMCP(ControlSurface):
                             name = params.get("name", "")
                             time_val = params.get("time", 0.0)
                             result = self._create_locator(name, time_val)
+                        elif command_type == "create_return_track":
+                            result = self._create_return_track()
+                        elif command_type == "set_send":
+                            result = self._set_send(
+                                params.get("track_index", 0),
+                                params.get("send_index", 0),
+                                params.get("value", 0.0),
+                                params.get("track_type", "track"),
+                            )
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -812,6 +824,91 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error creating audio track: " + str(e))
             raise
 
+    def _create_return_track(self):
+        """Append a return track via Song.create_return_track().
+
+        The Live API takes no index: return tracks are always added after the
+        existing ones, and every track (including the other returns) gets a
+        new send for it, at the end of mixer_device.sends.
+        """
+        try:
+            self._song.create_return_track()
+            new_index = len(self._song.return_tracks) - 1
+            new_track = self._song.return_tracks[new_index]
+            return {
+                "index": new_index,
+                "name": str(new_track.name),
+                "send_index": new_index,
+                "return_track_count": len(self._song.return_tracks),
+            }
+        except Exception as e:
+            self.log_message("Error creating return track: " + str(e))
+            raise
+
+    def _set_send(self, track_index, send_index, value, track_type="track"):
+        """Set track.mixer_device.sends[send_index].value.
+
+        send_index matches the index into Song.return_tracks (send A = 0).
+        track_type selects Song.tracks ("track") or Song.return_tracks
+        ("return"). The value is in the send parameter's own units (0.0-1.0
+        in Live, -inf dB to 0 dB); out-of-range values are rejected,
+        not clamped.
+        """
+        try:
+            if track_type == "track":
+                tracks = self._song.tracks
+            elif track_type == "return":
+                tracks = self._song.return_tracks
+            else:
+                raise ValueError(
+                    "track_type must be 'track' or 'return', got %s"
+                    % _short_repr(track_type))
+            if isinstance(track_index, bool) or not isinstance(track_index, int):
+                raise ValueError("track_index must be an integer")
+            if isinstance(send_index, bool) or not isinstance(send_index, int):
+                raise ValueError("send_index must be an integer")
+            if track_index < 0 or track_index >= len(tracks):
+                raise IndexError("Track index out of range")
+            track = tracks[track_index]
+            sends = list(track.mixer_device.sends)
+            if send_index < 0 or send_index >= len(sends):
+                raise IndexError(
+                    "Send index %d out of range (track has %d send(s))"
+                    % (send_index, len(sends)))
+            if not (_is_number(value) and _is_finite(value)):
+                raise ValueError("value must be a finite number")
+            send = sends[send_index]
+            lo, hi = float(send.min), float(send.max)
+            value = float(value)
+            if value < lo or value > hi:
+                raise ValueError(
+                    "value %s out of range [%s, %s]" % (value, lo, hi))
+            if not getattr(send, "is_enabled", True):
+                raise RuntimeError(
+                    "Send %d on this track is disabled and cannot be changed"
+                    % send_index)
+            old = float(send.value)
+            send.value = value
+            return_name = None
+            try:
+                return_name = str(self._song.return_tracks[send_index].name)
+            except Exception:
+                pass
+            return {
+                "track_type": track_type,
+                "track_index": track_index,
+                "track_name": str(track.name),
+                "send_index": send_index,
+                "send_name": str(getattr(send, "name", "Send %d" % send_index)),
+                "return_track_name": return_name,
+                "old_value": old,
+                "value": float(send.value),
+                "min": lo,
+                "max": hi,
+            }
+        except Exception as e:
+            self.log_message("Error setting send: " + str(e))
+            raise
 
     def _set_track_name(self, track_index, name):
         """Set the name of a track"""

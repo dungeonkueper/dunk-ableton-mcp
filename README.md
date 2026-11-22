@@ -251,6 +251,7 @@ Once the config file has been set on Claude, and the remote script is running in
 - Load instruments and effects from Ableton's browser
 - Add notes to MIDI clips
 - Change tempo and other session parameters
+- Create return tracks and set send levels
 
 ### Example Commands
 
@@ -297,6 +298,11 @@ The system uses a simple JSON-based protocol over TCP sockets:
 - **Live 13 Step Sequencer clips are not supported.** The Live API accepts notes written into a Step Sequencer clip but never shows or plays them, and it does not expose the clip's steps. `add_notes_to_clip` and `clear_notes_from_clip` therefore refuse any clip whose `midi_clip_type` is not 0 (convert the clip to MIDI first). `get_clip_notes`, `get_track_info` and session snapshots report `midi_clip_type`; for such clips `notes_may_not_match_ui` is `true`.
 
 ### Changelog
+
+**Remote Script 1.9.0** (update the Remote Script together with the server)
+
+- New tool `create_return_track`, mapped to `Song.create_return_track()`. Like the Live API it takes no index: the return track is appended, and every track gets a new send for it.
+- New tool `set_send(track_index, send_index, value, track_type="track")`, mapped to `track.mixer_device.sends[send_index].value`. `send_index` equals the return track index (send A = 0). `value` uses Live's units (0.0–1.0, i.e. −inf to 0 dB); out-of-range values fail the call instead of being clamped. `track_type="return"` sets a return track's send to another return.
 
 **Remote Script 1.8.0** (update the Remote Script together with the server)
 
