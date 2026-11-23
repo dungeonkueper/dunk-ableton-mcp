@@ -37,6 +37,8 @@ MODIFYING_TOOLS = {
     "set_tempo",
     "set_device_parameter",
     "set_send",
+    "set_clip_automation",
+    "clear_clip_automation",
     "load_instrument_or_effect",
     "load_drum_kit",
     "duplicate_to_arrangement",

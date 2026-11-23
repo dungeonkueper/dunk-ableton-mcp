@@ -66,6 +66,8 @@ ACTION_CATEGORIES = {
     "set_tempo": "mix",
     "set_device_parameter": "mix",
     "set_send": "mix",
+    "set_clip_automation": "mix",
+    "clear_clip_automation": "mix",
     "fire_clip": "transport",
     "stop_clip": "transport",
     "start_playback": "transport",
