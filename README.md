@@ -252,7 +252,15 @@ Once the config file has been set on Claude, and the remote script is running in
 - Add notes to MIDI clips
 - Change tempo and other session parameters
 - Create return tracks and set send levels
-- Write clip automation (e.g. filter sweeps, volume or send rides)
+- Write clip automation (e.g. filter sweeps, volume or send rides) and read it back
+- Mix: volume, pan, mute, solo, arm, monitoring and color per track
+- Manage tracks and scenes: duplicate, delete, create, launch, scene tempo and time signature
+- Edit clips: loop and markers, launch settings, audio gain/pitch/warp, quantize, crop, duplicate loop or region
+- Transport: arrangement loop, metronome, record/overdub/punch, time signature, locator jumps, capture MIDI
+- Undo: every tool call is one undo step; `undo` / `redo` tools
+- Create clips directly in the Arrangement (MIDI with notes, or audio files)
+- Insert Live's own devices by name, without a browser search (Live 12.3+)
+- Read and set the Set's key and scale (Live 12 Scale Mode)
 
 ### Example Commands
 
@@ -271,6 +279,10 @@ Here are some examples of what you can ask Claude to do:
 | *"Add a jazz chord progression to the clip in track 1"* | |
 | *"Set the tempo to 120 BPM"* | |
 | *"Play the clip in track 2"* | |
+| *"Set the song to D Dorian and write a bassline that stays in the scale"* | |
+| *"Put an 8-bar MIDI clip at bar 17 on the bass track and add an EQ Eight"* | |
+| *"Loop bars 9 to 16, turn on the metronome and solo the drums"* | |
+| *"Show me the filter automation in the lead clip"* | |
 
 ---
 
@@ -300,11 +312,41 @@ The system uses a simple JSON-based protocol over TCP sockets:
 
 ### Changelog
 
+**Remote Script 2.0.0** (update the Remote Script together with the server; Live 12 recommended)
+
+Undo
+- Every modifying command now runs inside one Live undo step (`Song.begin_undo_step` / `end_undo_step`), including the 1.x tools. One Cmd+Z reverts a whole tool call. New tools `undo` and `redo`.
+
+Mixer, tracks, scenes
+- `set_track_mixer(track_index, volume, panning, mute, solo, arm, monitoring, color_index, track_type)`: only the given values change, everything is validated before anything is written. `volume` uses Live's units (0.85 = 0 dB, 1.0 = +6 dB); the result reports Live's display value. Works on return tracks and the master track (volume/pan).
+- `delete_track`, `duplicate_track`, `delete_return_track`.
+- `create_scene`, `delete_scene`, `duplicate_scene`, `fire_scene`, `set_scene_properties` (name, tempo, tempo on/off, time signature, color).
+
+Clips
+- `set_clip_properties`: loop on/off, loop start/end, start/end markers, mute, color, launch mode and quantization, legato, velocity amount; for audio clips gain, pitch, warping and warp mode. Works on Session and Arrangement clips. Loop changes are applied in the order Live accepts (moving a loop past its current end works in one call).
+- `edit_clip(action=...)`: `quantize` (notes; grid and strength), `crop`, `duplicate_loop`, `duplicate_region` (MIDI), `duplicate_slot` (Session).
+
+Transport
+- `get_transport`: playing state, position, tempo, time signature, loop, metronome, record/overdub/punch, launch quantization, swing, song length, undo/redo availability, locators.
+- `set_transport`: loop on/off and range, metronome, record mode, arrangement overdub, session record, punch in/out, time signature, global launch quantization, swing. Live keeps the loop inside the song; when it adjusts a value the result says so.
+- `transport_action`: continue playing, stop all clips, jump by beats, jump to next/previous locator, tap tempo, capture MIDI, re-enable automation.
+
+Beyond most forks
+- `create_arrangement_clip(track_index, start_time, length, path, name, notes)`: creates a clip directly in the Arrangement with `Track.create_midi_clip` / `Track.create_audio_clip` (Live 12), no Session detour. MIDI clips can be filled with notes in the same call. `delete_arrangement_clip` removes one.
+- `get_clip_automation`: reads clip envelopes back (`Clip.automation_envelopes`, `Envelope.events_in_range`, `value_at_time`). Each envelope comes with the parameter indices `set_clip_automation` takes, so a model can check what it wrote. Optional regular sampling with `sample_step`.
+- `insert_device(track_index, device_name, device_index)`: inserts a native Live device by name with `Track.insert_device` (Live 12.3+), no browser walk. Plug-ins, presets and Max devices still go through `load_instrument_or_effect`.
+- `read_scale` / `set_scale`: key and scale of the Set (`Song.root_note`, `scale_name`, `scale_mode`, `scale_intervals`), including the note names in the scale. `root_note` takes "F#", "Bb" or 0–11.
+
+Known Live issues the tools now report
+- `duplicate_to_arrangement` warns when the Arrangement copy lost the Session clip's automation (seen in Live 12.4.5 on tracks with an instrument). Check the copy with `get_clip_automation`; the Live API cannot add new envelopes to Arrangement clips, so lost automation has to be redrawn in Live.
+- `create_locator` explains the failure when the time lies beyond the song end (Live does not move the playhead there).
+- `set_clip_automation` on an Arrangement clip explains that Live cannot create a new envelope there (existing ones can be edited).
+
 **Remote Script 1.9.0** (update the Remote Script together with the server)
 
 - New tool `create_return_track`, mapped to `Song.create_return_track()`. Like the Live API it takes no index: the return track is appended, and every track gets a new send for it.
 - New tool `set_send(track_index, send_index, value, track_type="track")`, mapped to `track.mixer_device.sends[send_index].value`. `send_index` equals the return track index (send A = 0). `value` uses Live's units (0.0–1.0, i.e. −inf to 0 dB); out-of-range values fail the call instead of being clamped. `track_type="return"` sets a return track's send to another return.
-- New tool `set_clip_automation(track_index, clip_index, points, parameter_type="device", ...)`, mapped to `Clip.automation_envelope` / `create_automation_envelope` and `AutomationEnvelope.insert_step`. Targets a device parameter (`device_index`, `parameter_index`), `volume`, `panning` or a `send` (`send_index`), on a Session clip or, with `clip_location="arrangement"`, an Arrangement clip. `points` are `{time, value}` breakpoints in beats from the clip start; since the Live API only writes steps, ramps are approximated with steps of `resolution` beats (default 0.25). Values outside the parameter range are rejected. Envelopes are copied along by `duplicate_to_arrangement`.
+- New tool `set_clip_automation(track_index, clip_index, points, parameter_type="device", ...)`, mapped to `Clip.automation_envelope` / `create_automation_envelope` and `AutomationEnvelope.insert_step`. Targets a device parameter (`device_index`, `parameter_index`), `volume`, `panning` or a `send` (`send_index`), on a Session clip or, with `clip_location="arrangement"`, an Arrangement clip. `points` are `{time, value}` breakpoints in beats from the clip start; since the Live API only writes steps, ramps are approximated with steps of `resolution` beats (default 0.25). Values outside the parameter range are rejected. Envelopes are usually copied along by `duplicate_to_arrangement` (see the 2.0.0 note on Live 12.4.5).
 - New tool `clear_clip_automation`, mapped to `Clip.clear_envelope` (one parameter) or `Clip.clear_all_envelopes` (`parameter_type="all"`).
 
 **Remote Script 1.8.0** (update the Remote Script together with the server)

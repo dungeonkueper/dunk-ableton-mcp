@@ -18,6 +18,16 @@ from .dataset.trajectory_decorator import trajectory_tool
 ABLETON_HOST = os.environ.get("ABLETON_HOST", "localhost")
 ABLETON_PORT = int(os.environ.get("ABLETON_PORT", "9877"))
 
+# 2.0 commands that change Live's state; they get the modifying-command
+# socket timeout (mirrors V2_MAIN_THREAD_COMMANDS in the Remote Script).
+V2_MODIFYING_COMMANDS = frozenset({
+    "set_track_mixer", "delete_track", "duplicate_track",
+    "delete_return_track", "create_scene", "delete_scene", "duplicate_scene",
+    "fire_scene", "set_scene_properties", "set_clip_properties", "edit_clip",
+    "create_arrangement_clip", "delete_arrangement_clip", "insert_device",
+    "set_scale", "set_transport", "transport_action", "undo", "redo",
+})
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -151,7 +161,7 @@ class AbletonConnection:
             "create_locator",
             "create_return_track", "set_send",
             "set_clip_automation", "clear_clip_automation",
-        ]
+        ] or command_type in V2_MODIFYING_COMMANDS
 
         # Commands whose work on Live's main thread can take noticeably longer
         # than the default modifying-command budget (e.g. importing/decoding a
@@ -812,9 +822,11 @@ def set_clip_automation(
 
     Live API: Clip.automation_envelope / create_automation_envelope and
     AutomationEnvelope.insert_step. The envelope belongs to the clip, so it
-    plays with the clip and is copied along by duplicate_to_arrangement. For
-    a sweep across several arrangement clips, write one segment per clip
-    (clip_location="arrangement").
+    plays with the clip. duplicate_to_arrangement usually copies it, but Live
+    12.4.5 can drop it on instrument tracks (the tool then warns; check with
+    get_clip_automation). Live can only create new envelopes on Session
+    clips; on Arrangement clips existing envelopes can be rewritten.
+    For a sweep across several arrangement clips, write one segment per clip.
 
     Ramps between points are written as steps of `resolution` beats holding
     the linearly interpolated value (Live's API only writes steps). Two points
@@ -929,6 +941,719 @@ def clear_clip_automation(
     except Exception as e:
         logger.error(f"Error clearing clip automation: {str(e)}")
         raise ToolError(f"Error clearing clip automation: {str(e)}") from e
+
+
+# ══ 2.0 tools ════════════════════════════════════════════════════════════
+#
+# Each modifying 2.0 command runs inside one Live undo step, so one Cmd+Z (or
+# the undo tool) reverts a whole tool call.
+
+
+def _v2_command(command: str, params: dict[str, Any], what: str) -> dict[str, Any]:
+    """Send a 2.0 command after the capability check; errors become ToolError.
+
+    None values are dropped so the Remote Script only sees what the caller set.
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability(command)
+        if missing:
+            raise ToolError(missing)
+        ableton = get_ableton_connection()
+        clean = {k: v for k, v in params.items() if v is not None}
+        return ableton.send_command(command, clean)
+    except ToolError:
+        raise
+    except Exception as e:
+        logger.error(f"Error {what}: {str(e)}")
+        raise ToolError(f"Error {what}: {str(e)}") from e
+
+
+def _json(result: Any) -> str:
+    return json.dumps(result, indent=2)
+
+
+# ── Mixer and tracks ────────────────────────────────────────────────────────
+
+@mcp.tool()
+@rich_telemetry_tool("set_track_mixer")
+@trajectory_tool("set_track_mixer")
+def set_track_mixer(
+    ctx: Context,
+    track_index: int = 0,
+    volume: float | None = None,
+    panning: float | None = None,
+    mute: bool | None = None,
+    solo: bool | None = None,
+    arm: bool | None = None,
+    monitoring: str | None = None,
+    color_index: int | None = None,
+    track_type: str = "track",
+    user_prompt: str = "",
+) -> str:
+    """
+    Set a track's mixer: volume, pan, mute, solo, arm, monitoring, color.
+
+    Only the arguments you pass are changed. Values are validated before
+    anything is written, so a bad value changes nothing.
+
+    Parameters:
+    - track_index: Index into Song.tracks (or return_tracks for track_type
+      "return"; ignored for "master")
+    - volume: Fader in Live's units, 0.0 to 1.0. 0.85 is 0 dB, 1.0 is +6 dB,
+      0.0 is -inf. The result shows the dB value Live displays.
+    - panning: -1.0 (left) to 1.0 (right), 0 = center
+    - mute, solo: true/false (not on the master track)
+    - arm: true/false (regular MIDI/audio tracks only)
+    - monitoring: "in", "auto" or "off" (regular tracks only)
+    - color_index: Live color palette index 0-69
+    - track_type: "track" (default), "return" or "master"
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("set_track_mixer", {
+        "track_index": track_index, "track_type": track_type,
+        "volume": volume, "panning": panning, "mute": mute, "solo": solo,
+        "arm": arm, "monitoring": monitoring, "color_index": color_index,
+    }, "setting track mixer")
+    parts = []
+    for key, change in result.get("changes", {}).items():
+        new = change.get("new")
+        if isinstance(new, dict):
+            new = new.get("display") or new.get("value")
+        parts.append(f"{key} → {new}")
+    return f"'{result.get('track_name')}': " + ", ".join(parts)
+
+
+@mcp.tool()
+@telemetry_tool("delete_track")
+@trajectory_tool("delete_track")
+def delete_track(ctx: Context, track_index: int, user_prompt: str = "") -> str:
+    """
+    Delete a track (Live API: Song.delete_track). Undo restores it.
+
+    Parameters:
+    - track_index: Index into Song.tracks. Live keeps at least one track.
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("delete_track", {"track_index": track_index},
+                         "deleting track")
+    return (f"Deleted track {result.get('deleted_index')} "
+            f"'{result.get('deleted_name')}' ({result.get('track_count')} tracks left)")
+
+
+@mcp.tool()
+@telemetry_tool("duplicate_track")
+@trajectory_tool("duplicate_track")
+def duplicate_track(ctx: Context, track_index: int, user_prompt: str = "") -> str:
+    """
+    Duplicate a track with its devices and clips (Live API: Song.duplicate_track).
+    The copy is inserted right after the original.
+
+    Parameters:
+    - track_index: Index into Song.tracks
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("duplicate_track", {"track_index": track_index},
+                         "duplicating track")
+    return (f"Duplicated track {track_index} as track {result.get('new_index')} "
+            f"'{result.get('new_name')}'")
+
+
+@mcp.tool()
+@telemetry_tool("delete_return_track")
+@trajectory_tool("delete_return_track")
+def delete_return_track(ctx: Context, return_index: int, user_prompt: str = "") -> str:
+    """
+    Delete a return track (Live API: Song.delete_return_track). The matching
+    send disappears from every track, and later sends shift down by one.
+
+    Parameters:
+    - return_index: Index into Song.return_tracks (0 = A)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("delete_return_track", {"return_index": return_index},
+                         "deleting return track")
+    return (f"Deleted return track '{result.get('deleted_name')}' "
+            f"({result.get('return_track_count')} return tracks left)")
+
+
+# ── Scenes ──────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+@telemetry_tool("create_scene")
+@trajectory_tool("create_scene")
+def create_scene(ctx: Context, index: int = -1, name: str = "", user_prompt: str = "") -> str:
+    """
+    Create a scene (Live API: Song.create_scene).
+
+    Parameters:
+    - index: Position to insert at; -1 (default) appends at the end
+    - name: Optional scene name
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("create_scene", {"index": index, "name": name or None},
+                         "creating scene")
+    return f"Created scene {result.get('index')} '{result.get('name')}'"
+
+
+@mcp.tool()
+@telemetry_tool("delete_scene")
+@trajectory_tool("delete_scene")
+def delete_scene(ctx: Context, scene_index: int, user_prompt: str = "") -> str:
+    """
+    Delete a scene and its clip slots (Live API: Song.delete_scene).
+
+    Parameters:
+    - scene_index: Index into Song.scenes. Live keeps at least one scene.
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("delete_scene", {"scene_index": scene_index},
+                         "deleting scene")
+    return f"Deleted scene {scene_index} '{result.get('deleted_name')}'"
+
+
+@mcp.tool()
+@telemetry_tool("duplicate_scene")
+@trajectory_tool("duplicate_scene")
+def duplicate_scene(ctx: Context, scene_index: int, user_prompt: str = "") -> str:
+    """
+    Duplicate a scene with its clips (Live API: Song.duplicate_scene).
+    The copy is inserted right after the original.
+
+    Parameters:
+    - scene_index: Index into Song.scenes
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("duplicate_scene", {"scene_index": scene_index},
+                         "duplicating scene")
+    return f"Duplicated scene {scene_index} as scene {result.get('new_index')}"
+
+
+@mcp.tool()
+@telemetry_tool("fire_scene")
+@trajectory_tool("fire_scene")
+def fire_scene(ctx: Context, scene_index: int, user_prompt: str = "") -> str:
+    """
+    Launch a scene (Live API: Scene.fire).
+
+    Parameters:
+    - scene_index: Index into Song.scenes
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("fire_scene", {"scene_index": scene_index},
+                         "firing scene")
+    return f"Fired scene {scene_index} '{result.get('name')}'"
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_scene_properties")
+@trajectory_tool("set_scene_properties")
+def set_scene_properties(
+    ctx: Context,
+    scene_index: int,
+    name: str | None = None,
+    tempo: float | None = None,
+    tempo_enabled: bool | None = None,
+    time_signature_numerator: int | None = None,
+    time_signature_denominator: int | None = None,
+    color_index: int | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Set a scene's name, tempo, time signature or color.
+
+    Parameters:
+    - scene_index: Index into Song.scenes
+    - name: New scene name
+    - tempo: Scene tempo in BPM (20-999); also pass tempo_enabled=true so
+      launching the scene changes the song tempo
+    - tempo_enabled: Whether launching the scene sets the tempo
+    - time_signature_numerator / time_signature_denominator: Scene time
+      signature (denominator 1, 2, 4, 8 or 16)
+    - color_index: Live color palette index 0-69
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("set_scene_properties", {
+        "scene_index": scene_index, "name": name, "tempo": tempo,
+        "tempo_enabled": tempo_enabled,
+        "time_signature_numerator": time_signature_numerator,
+        "time_signature_denominator": time_signature_denominator,
+        "color_index": color_index,
+    }, "setting scene properties")
+    return (f"Scene {scene_index} '{result.get('name')}': changed "
+            + ", ".join(result.get("changed", [])))
+
+
+# ── Clips ───────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+@rich_telemetry_tool("set_clip_properties")
+@trajectory_tool("set_clip_properties")
+def set_clip_properties(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    clip_location: str = "session",
+    name: str | None = None,
+    looping: bool | None = None,
+    loop_start: float | None = None,
+    loop_end: float | None = None,
+    start_marker: float | None = None,
+    end_marker: float | None = None,
+    muted: bool | None = None,
+    color_index: int | None = None,
+    launch_mode: str | None = None,
+    launch_quantization: int | None = None,
+    legato: bool | None = None,
+    velocity_amount: float | None = None,
+    gain: float | None = None,
+    pitch_coarse: int | None = None,
+    pitch_fine: float | None = None,
+    warping: bool | None = None,
+    warp_mode: str | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Set clip properties: loop and markers, mute, launch settings, color, and
+    for audio clips gain, pitch and warping. Only what you pass is changed.
+
+    Positions are in beats from the clip's start, the same time base as notes.
+
+    Parameters:
+    - track_index, clip_index: The clip; clip_index is a Session slot, or an
+      index from get_arrangement_clips when clip_location is "arrangement"
+    - clip_location: "session" (default) or "arrangement"
+    - looping: Loop on/off
+    - loop_start / loop_end: Loop brace in beats (end must be after start)
+    - start_marker / end_marker: Playback start/end markers in beats
+    - muted: Clip activator off (true) or on (false)
+    - color_index: Live color palette index 0-69
+    - launch_mode: "trigger", "gate", "toggle" or "repeat"
+    - launch_quantization: 0 = global, 1 = none, 2 = 8 bars, 3 = 4 bars,
+      4 = 2 bars, 5 = 1 bar, 6 = 1/2, 7 = 1/2T, 8 = 1/4, 9 = 1/4T, 10 = 1/8,
+      11 = 1/8T, 12 = 1/16, 13 = 1/16T, 14 = 1/32
+    - legato: Legato launch on/off
+    - velocity_amount: How much note velocity affects volume, 0.0-1.0
+    - gain: Audio clip gain in Live's units 0.0-1.0 (audio only)
+    - pitch_coarse: Semitones -48..48 (audio only)
+    - pitch_fine: Cents -50..50 (audio only)
+    - warping: Warp on/off (audio only)
+    - warp_mode: "beats", "tones", "texture", "re-pitch", "complex" or
+      "complex pro" (audio only)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("set_clip_properties", {
+        "track_index": track_index, "clip_index": clip_index,
+        "clip_location": clip_location, "name": name, "looping": looping,
+        "loop_start": loop_start, "loop_end": loop_end,
+        "start_marker": start_marker, "end_marker": end_marker,
+        "muted": muted, "color_index": color_index,
+        "launch_mode": launch_mode, "launch_quantization": launch_quantization,
+        "legato": legato, "velocity_amount": velocity_amount, "gain": gain,
+        "pitch_coarse": pitch_coarse, "pitch_fine": pitch_fine,
+        "warping": warping, "warp_mode": warp_mode,
+    }, "setting clip properties")
+    return ("Changed " + ", ".join(result.get("changed", []))
+            + f" on clip '{result.get('clip', {}).get('name')}'. Now: "
+            + _json(result.get("clip", {})))
+
+
+@mcp.tool()
+@rich_telemetry_tool("edit_clip")
+@trajectory_tool("edit_clip")
+def edit_clip(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    action: str,
+    clip_location: str = "session",
+    grid: str = "1/16",
+    amount: float = 1.0,
+    region_start: float | None = None,
+    region_length: float | None = None,
+    destination_time: float | None = None,
+    pitch: int = -1,
+    transposition: int = 0,
+    user_prompt: str = "",
+) -> str:
+    """
+    Edit a clip with Live's clip commands.
+
+    Actions:
+    - "quantize": Quantize the clip's notes to `grid`
+      ("1/4", "1/8", "1/8t", "1/8+1/8t", "1/16", "1/16t", "1/16+1/16t",
+      "1/32") with strength `amount` 0.0-1.0
+    - "crop": Remove everything outside the loop (or the markers)
+    - "duplicate_loop": Double the loop and its content
+    - "duplicate_region": Copy notes from region_start for region_length
+      beats to destination_time (MIDI only; pitch -1 = all notes, else only
+      that pitch; transposition in semitones)
+    - "duplicate_slot": Copy the Session clip into the next free slot below
+
+    Parameters:
+    - track_index, clip_index, clip_location: as in set_clip_properties
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("edit_clip", {
+        "track_index": track_index, "clip_index": clip_index,
+        "clip_location": clip_location, "action": action, "grid": grid,
+        "amount": amount, "region_start": region_start,
+        "region_length": region_length, "destination_time": destination_time,
+        "pitch": pitch, "transposition": transposition,
+    }, "editing clip")
+    extra = ""
+    if result.get("new_clip_index") is not None:
+        extra = f", copy in slot {result['new_clip_index']}"
+    return (f"{action} on clip '{result.get('clip_name')}' done{extra}; "
+            f"length {result.get('length')}, loop {result.get('loop_start')}"
+            f"–{result.get('loop_end')}")
+
+
+# ── Arrangement clips ───────────────────────────────────────────────────────
+
+@mcp.tool()
+@rich_telemetry_tool("create_arrangement_clip", capture_notes=True)
+@trajectory_tool("create_arrangement_clip")
+def create_arrangement_clip(
+    ctx: Context,
+    track_index: int,
+    start_time: float,
+    length: float = 4.0,
+    path: str | None = None,
+    name: str | None = None,
+    notes: list[dict] | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Create a clip directly in the Arrangement, without a Session clip
+    (Live API: Track.create_midi_clip / Track.create_audio_clip, Live 12).
+
+    On a MIDI track this creates an empty MIDI clip of `length` beats,
+    optionally filled with `notes` (same format as add_notes_to_clip). On an
+    audio track pass `path` to place an audio file; its length comes from the
+    file. Note: the Live API cannot add new automation envelopes to
+    Arrangement clips; for clip automation write it on a Session clip and use
+    duplicate_to_arrangement.
+
+    Parameters:
+    - track_index: Index into Song.tracks
+    - start_time: Arrangement position in beats (0 = start; bar 9 in 4/4 = 32)
+    - length: MIDI clip length in beats (default 4)
+    - path: Absolute path to an audio file (audio tracks only)
+    - name: Optional clip name
+    - notes: Optional MIDI notes [{pitch, start_time, duration, velocity, ...}]
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("create_arrangement_clip", {
+        "track_index": track_index, "start_time": start_time,
+        "length": length, "path": path, "name": name, "notes": notes,
+    }, "creating arrangement clip")
+    kind = "audio" if result.get("is_audio_clip") else "MIDI"
+    notes_txt = (f" with {result.get('note_count')} notes"
+                 if result.get("note_count") else "")
+    return (f"Created {kind} clip '{result.get('name')}' on "
+            f"'{result.get('track_name')}' at beats {result.get('start_time')}"
+            f"–{result.get('end_time')}{notes_txt} (arrangement clip_index "
+            f"{result.get('clip_index')})")
+
+
+@mcp.tool()
+@telemetry_tool("delete_arrangement_clip")
+@trajectory_tool("delete_arrangement_clip")
+def delete_arrangement_clip(ctx: Context, track_index: int, clip_index: int,
+                            user_prompt: str = "") -> str:
+    """
+    Delete an Arrangement clip (Live API: Track.delete_clip).
+
+    Parameters:
+    - track_index: Index into Song.tracks
+    - clip_index: Index from get_arrangement_clips
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("delete_arrangement_clip", {
+        "track_index": track_index, "clip_index": clip_index,
+    }, "deleting arrangement clip")
+    return (f"Deleted arrangement clip '{result.get('name')}' at beat "
+            f"{result.get('start_time')}")
+
+
+# ── Automation read-back ────────────────────────────────────────────────────
+
+@mcp.tool()
+@telemetry_tool("get_clip_automation")
+@trajectory_tool("get_clip_automation", modifying=False)
+def get_clip_automation(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    clip_location: str = "session",
+    parameter_type: str = "all",
+    device_index: int | None = None,
+    parameter_index: int | None = None,
+    send_index: int | None = None,
+    sample_step: float | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Read clip automation back (Live API: Clip.automation_envelopes,
+    Envelope.events_in_range and value_at_time). Use it to check what
+    set_clip_automation wrote, or to see existing automation before editing.
+
+    Returns, per envelope, the parameter (with the indices set_clip_automation
+    takes), its min/max, and `points`: breakpoints {time, value} in beats from
+    the clip start. Steps written by set_clip_automation read back as pairs;
+    runs of equal values are collapsed to their first and last point.
+
+    Parameters:
+    - track_index, clip_index, clip_location: as in set_clip_automation
+    - parameter_type: "all" (default, every envelope in the clip), or
+      "device" / "volume" / "panning" / "send" with the matching indices
+    - sample_step: Optional; also return the envelope value every N beats
+      (minimum 0.03125)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("get_clip_automation", {
+        "track_index": track_index, "clip_index": clip_index,
+        "clip_location": clip_location, "parameter_type": parameter_type,
+        "device_index": device_index, "parameter_index": parameter_index,
+        "send_index": send_index, "sample_step": sample_step,
+    }, "reading clip automation")
+    return _json(result)
+
+
+# ── Devices ─────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+@rich_telemetry_tool("insert_device")
+@trajectory_tool("insert_device")
+def insert_device(
+    ctx: Context,
+    track_index: int,
+    device_name: str,
+    device_index: int = -1,
+    track_type: str = "track",
+    user_prompt: str = "",
+) -> str:
+    """
+    Insert a native Live device by name, without searching the browser
+    (Live API: Track.insert_device, Live 12.3+). Faster and more predictable
+    than load_instrument_or_effect for Live's own instruments and effects.
+
+    Use the name shown in Live's browser, e.g. "Operator", "Drift", "Wavetable",
+    "Simpler", "Drum Rack", "EQ Eight", "Compressor", "Auto Filter", "Reverb",
+    "Delay", "Saturator", "Utility". Plug-ins, presets and Max for Live
+    devices still need load_instrument_or_effect.
+
+    Parameters:
+    - track_index: Index into Song.tracks (or return_tracks for "return";
+      ignored for "master")
+    - device_name: Native device name
+    - device_index: Position in the device chain; -1 (default) appends
+    - track_type: "track" (default), "return" or "master"
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("insert_device", {
+        "track_index": track_index, "device_name": device_name,
+        "device_index": device_index, "track_type": track_type,
+    }, "inserting device")
+    return (f"Inserted '{result.get('device_name')}' on "
+            f"'{result.get('track_name')}' at device_index "
+            f"{result.get('device_index')} ({result.get('parameter_count')} "
+            f"parameters; see get_device_parameters)")
+
+
+# ── Scale ───────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+@telemetry_tool("read_scale")
+@trajectory_tool("read_scale", modifying=False)
+def read_scale(ctx: Context, include_available: bool = False, user_prompt: str = "") -> str:
+    """
+    Read the Live Set's key and scale (Live 12: Song.root_note, scale_name,
+    scale_mode, scale_intervals), including the note names in the scale.
+
+    Parameters:
+    - include_available: Also list every scale name Live knows
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    return _json(_v2_command("read_scale", {"include_available": include_available},
+                             "reading scale"))
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_scale")
+@trajectory_tool("set_scale")
+def set_scale(
+    ctx: Context,
+    root_note: str | None = None,
+    scale_name: str | None = None,
+    scale_mode: bool | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Set the Live Set's key and scale (Live 12 Scale Mode).
+
+    Parameters:
+    - root_note: Note name ("C", "F#", "Bb") or 0-11 (0 = C)
+    - scale_name: Live scale name, e.g. "Major", "Minor", "Dorian",
+      "Minor Pentatonic", "Harmonic Minor" (read_scale with
+      include_available=true lists all)
+    - scale_mode: Turn Scale Mode on (highlights and folds to the scale in
+      the MIDI editor) or off
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    root: Any = root_note
+    if isinstance(root_note, str) and root_note.strip().isdigit():
+        root = int(root_note.strip())
+    result = _v2_command("set_scale", {
+        "root_note": root, "scale_name": scale_name, "scale_mode": scale_mode,
+    }, "setting scale")
+    new = result.get("new", {})
+    return (f"Scale is now {new.get('root_name')} {new.get('scale_name')} "
+            f"(scale mode {'on' if new.get('scale_mode') else 'off'}): "
+            + " ".join(new.get("note_names", [])))
+
+
+# ── Transport and undo ──────────────────────────────────────────────────────
+
+@mcp.tool()
+@telemetry_tool("get_transport")
+@trajectory_tool("get_transport", modifying=False)
+def get_transport(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Read the transport: playing state, position, tempo, time signature,
+    arrangement loop, metronome, record/overdub/punch, launch quantization,
+    swing, song length, undo/redo availability and locators.
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    return _json(_v2_command("get_transport", {}, "reading transport"))
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_transport")
+@trajectory_tool("set_transport")
+def set_transport(
+    ctx: Context,
+    loop: bool | None = None,
+    loop_start: float | None = None,
+    loop_length: float | None = None,
+    metronome: bool | None = None,
+    record_mode: bool | None = None,
+    arrangement_overdub: bool | None = None,
+    session_record: bool | None = None,
+    punch_in: bool | None = None,
+    punch_out: bool | None = None,
+    signature_numerator: int | None = None,
+    signature_denominator: int | None = None,
+    clip_trigger_quantization: int | None = None,
+    swing_amount: float | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Set transport options. Only what you pass is changed.
+
+    Parameters:
+    - loop: Arrangement loop on/off
+    - loop_start / loop_length: Arrangement loop in beats. Live does not
+      place the loop beyond the song end; the result warns when Live
+      adjusted a value.
+    - metronome: Click on/off
+    - record_mode: Arrangement record on/off (starts recording when playing)
+    - arrangement_overdub: MIDI arrangement overdub on/off
+    - session_record: Session record button on/off
+    - punch_in / punch_out: Punch switches
+    - signature_numerator / signature_denominator: Song time signature
+    - clip_trigger_quantization: Global launch quantization: 0 = none,
+      1 = 8 bars, 2 = 4 bars, 3 = 2 bars, 4 = 1 bar, 5 = 1/2, 6 = 1/2T,
+      7 = 1/4, 8 = 1/4T, 9 = 1/8, 10 = 1/8T, 11 = 1/16, 12 = 1/16T, 13 = 1/32
+    - swing_amount: Global swing for quantizing, 0.0-1.0
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("set_transport", {
+        "loop": loop, "loop_start": loop_start, "loop_length": loop_length,
+        "metronome": metronome, "record_mode": record_mode,
+        "arrangement_overdub": arrangement_overdub,
+        "session_record": session_record, "punch_in": punch_in,
+        "punch_out": punch_out, "signature_numerator": signature_numerator,
+        "signature_denominator": signature_denominator,
+        "clip_trigger_quantization": clip_trigger_quantization,
+        "swing_amount": swing_amount,
+    }, "setting transport")
+    state = result.get("state", {})
+    text = ("Changed " + ", ".join(result.get("changed", []))
+            + f". Loop {'on' if state.get('loop') else 'off'} "
+            f"{state.get('loop_start')}+{state.get('loop_length')} beats, "
+            f"metronome {'on' if state.get('metronome') else 'off'}, "
+            f"{state.get('signature_numerator')}/{state.get('signature_denominator')}")
+    for warning in result.get("warnings", []):
+        text += f"\nWarning: {warning}"
+    return text
+
+
+@mcp.tool()
+@telemetry_tool("transport_action")
+@trajectory_tool("transport_action")
+def transport_action(
+    ctx: Context,
+    action: str,
+    beats: float | None = None,
+    quantized: bool = True,
+    user_prompt: str = "",
+) -> str:
+    """
+    Run a transport command.
+
+    Actions:
+    - "continue_playing": Resume from the current position
+    - "stop_all_clips": Stop all Session clips (quantized unless quantized=false)
+    - "jump_by": Move the playhead by `beats` (negative = back)
+    - "jump_to_next_cue" / "jump_to_prev_cue": Go to the next/previous locator
+    - "tap_tempo": One tempo tap
+    - "capture_midi": Capture MIDI that was just played into a clip
+    - "re_enable_automation": Re-enable automation overridden by hand
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("transport_action", {
+        "action": action, "beats": beats, "quantized": quantized,
+    }, "running transport action")
+    return (f"{action} done; position {result.get('current_song_time')}, "
+            f"{'playing' if result.get('is_playing') else 'stopped'}")
+
+
+@mcp.tool()
+@telemetry_tool("undo")
+@trajectory_tool("undo", modifying=False)
+def undo(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Undo the last change in Live (Song.undo). Every modifying tool of this
+    server is one undo step, so this reverts the last whole tool call.
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("undo", {}, "undoing")
+    return (f"Undone. can_undo={result.get('can_undo')}, "
+            f"can_redo={result.get('can_redo')}")
+
+
+@mcp.tool()
+@telemetry_tool("redo")
+@trajectory_tool("redo", modifying=False)
+def redo(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Redo the last undone change in Live (Song.redo).
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    result = _v2_command("redo", {}, "redoing")
+    return (f"Redone. can_undo={result.get('can_undo')}, "
+            f"can_redo={result.get('can_redo')}")
 
 
 @mcp.tool()
@@ -1605,10 +2330,13 @@ def duplicate_to_arrangement(
         )
         clip_name = result.get("clip_name", "clip")
         track_name = result.get("track_name", f"track {track_index}")
-        return (
+        text = (
             f"Duplicated '{clip_name}' from Session slot {clip_index} "
             f"on '{track_name}' to arrangement at beat {destination_time}"
         )
+        if result.get("warning"):
+            text += f"\nWarning: {result['warning']}"
+        return text
     except Exception as e:
         logger.error(f"Error duplicating clip to arrangement: {str(e)}")
         return f"Error duplicating clip to arrangement: {str(e)}"

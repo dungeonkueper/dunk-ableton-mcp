@@ -35,8 +35,39 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.9.0"
+SCRIPT_VERSION = "2.0.0"
 PROTOCOL_VERSION = 1
+
+# 2.0 commands: name -> handler method. Main-thread commands change Live's
+# state and run inside one undo step; read commands run on the socket thread.
+V2_MAIN_THREAD_COMMANDS = {
+    "set_track_mixer": "_set_track_mixer",
+    "delete_track": "_delete_track",
+    "duplicate_track": "_duplicate_track",
+    "delete_return_track": "_delete_return_track",
+    "create_scene": "_create_scene",
+    "delete_scene": "_delete_scene",
+    "duplicate_scene": "_duplicate_scene",
+    "fire_scene": "_fire_scene",
+    "set_scene_properties": "_set_scene_properties",
+    "set_clip_properties": "_set_clip_properties",
+    "edit_clip": "_edit_clip",
+    "create_arrangement_clip": "_create_arrangement_clip",
+    "delete_arrangement_clip": "_delete_arrangement_clip",
+    "insert_device": "_insert_device",
+    "set_scale": "_set_scale",
+    "set_transport": "_set_transport",
+    "transport_action": "_transport_action",
+    "undo": "_undo",
+    "redo": "_redo",
+}
+V2_READ_COMMANDS = {
+    "get_clip_automation": "_get_clip_automation",
+    "read_scale": "_read_scale",
+    "get_transport": "_get_transport",
+}
+# Grouping undo/redo themselves into an undo step would make them undoable.
+V2_UNGROUPED_COMMANDS = frozenset({"undo", "redo"})
 
 SCRIPT_CAPABILITIES = [
     "get_session_info",
@@ -62,7 +93,7 @@ SCRIPT_CAPABILITIES = [
     "set_send",
     "set_clip_automation",
     "clear_clip_automation",
-]
+] + sorted(V2_MAIN_THREAD_COMMANDS) + sorted(V2_READ_COMMANDS)
 
 # ── Note validation (pure; no Live dependency so it can be unit-tested) ──────
 
@@ -273,6 +304,134 @@ def build_automation_steps(points, clip_length, lo, hi, resolution=0.25):
     if clip_length - last_t > 1e-9:
         steps.append((last_t, clip_length - last_t, last_v))
     return steps
+
+
+# ── 2.0 helpers (pure; no Live dependency so they can be unit-tested) ───────
+
+# Clip.quantize() grid argument (Live.Song.RecordingQuantization order).
+QUANTIZE_GRIDS = {
+    "1/4": 1, "1/8": 2, "1/8t": 3, "1/8+1/8t": 4, "1/16": 5,
+    "1/16t": 6, "1/16+1/16t": 7, "1/32": 8,
+}
+# Clip.launch_mode
+LAUNCH_MODES = {"trigger": 0, "gate": 1, "toggle": 2, "repeat": 3}
+# Track.current_monitoring_state
+MONITORING_STATES = {"in": 0, "auto": 1, "off": 2}
+# Clip.warp_mode (5 is unused by Live)
+WARP_MODES = {"beats": 0, "tones": 1, "texture": 2, "re-pitch": 3,
+              "complex": 4, "complex pro": 6}
+NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+_FLATS = {"DB": 1, "EB": 3, "GB": 6, "AB": 8, "BB": 10, "CB": 11, "FB": 4}
+# Live's built-in scale names, used when Live.Song.get_all_scales_ordered()
+# is unavailable (older Live 12 builds).
+DEFAULT_SCALE_NAMES = (
+    "Major", "Minor", "Dorian", "Mixolydian", "Lydian", "Phrygian", "Locrian",
+    "Whole Tone", "Half-whole Dim.", "Whole-half Dim.", "Minor Blues",
+    "Minor Pentatonic", "Major Pentatonic", "Harmonic Minor",
+    "Harmonic Major", "Dorian #4", "Phrygian Dominant", "Melodic Minor",
+    "Lydian Augmented", "Lydian Dominant", "Super Locrian", "8-Tone Spanish",
+    "Bhairav", "Hungarian Minor", "Hirajoshi", "In-Sen", "Iwato", "Kumoi",
+    "Pelog Selisir", "Pelog Tembung", "Messiaen 3", "Messiaen 4",
+    "Messiaen 5", "Messiaen 6", "Messiaen 7",
+)
+# Most envelope events one get_clip_automation call returns per parameter.
+MAX_ENVELOPE_EVENTS = 2048
+
+
+def check_int(name, value, lo=None, hi=None):
+    """Return ``value`` as int or raise ValueError (bools are rejected)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("%s must be an integer, got %s"
+                         % (name, _short_repr(value)))
+    if lo is not None and value < lo:
+        raise ValueError("%s must be >= %s, got %s" % (name, lo, value))
+    if hi is not None and value > hi:
+        raise ValueError("%s must be <= %s, got %s" % (name, hi, value))
+    return value
+
+
+def check_number(name, value, lo=None, hi=None):
+    """Return ``value`` as float or raise ValueError (range is inclusive)."""
+    if not (_is_number(value) and _is_finite(value)):
+        raise ValueError("%s must be a finite number, got %s"
+                         % (name, _short_repr(value)))
+    value = float(value)
+    if (lo is not None and value < lo) or (hi is not None and value > hi):
+        raise ValueError("%s %s out of range [%s, %s]" % (name, value, lo, hi))
+    return value
+
+
+def check_bool(name, value):
+    if not isinstance(value, bool):
+        raise ValueError("%s must be true or false, got %s"
+                         % (name, _short_repr(value)))
+    return value
+
+
+def lookup_choice(name, value, choices):
+    """Map a name (case-insensitive) or a valid int to its enum value."""
+    if isinstance(value, bool):
+        raise ValueError("%s must be one of %s" % (name, ", ".join(choices)))
+    if isinstance(value, int):
+        if value in choices.values():
+            return value
+    elif isinstance(value, str) and value.strip().lower() in choices:
+        return choices[value.strip().lower()]
+    raise ValueError("%s must be one of %s, got %s"
+                     % (name, ", ".join(choices), _short_repr(value)))
+
+
+def parse_root_note(value):
+    """0-11, or a note name such as "C", "F#", "Bb" -> 0-11."""
+    if isinstance(value, bool):
+        raise ValueError("root_note must be 0-11 or a note name like 'F#'")
+    if isinstance(value, int):
+        return check_int("root_note", value, 0, 11)
+    if isinstance(value, str):
+        key = value.strip().upper()
+        if key in NOTE_NAMES:
+            return NOTE_NAMES.index(key)
+        if key in _FLATS:
+            return _FLATS[key]
+    raise ValueError("root_note must be 0-11 or a note name like 'F#' or "
+                     "'Bb', got %s" % _short_repr(value))
+
+
+def match_scale_name(value, known):
+    """Case-insensitive match of ``value`` against Live's scale names."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("scale_name must be a non-empty string")
+    wanted = value.strip().lower()
+    for name in known:
+        if name.lower() == wanted:
+            return name
+    raise ValueError("Unknown scale %s. Known scales: %s"
+                     % (_short_repr(value), ", ".join(known)))
+
+
+def scale_note_names(root_note, intervals):
+    """Pitch-class names of a scale, e.g. (9, [0,2,3,...]) -> A B C ..."""
+    return [NOTE_NAMES[(int(root_note) + int(i)) % 12] for i in intervals]
+
+
+def compress_envelope_events(events):
+    """Turn raw (time, value) envelope events into breakpoints.
+
+    insert_step writes every step as two events (start and end of the step),
+    so a ramp of 64 steps reads back as 128 events. Consecutive events with
+    the same value collapse to the first and the last of the run, which keeps
+    jumps and holds exact while dropping redundant interior points.
+    """
+    pts = sorted(((float(t), float(v)) for t, v in events), key=lambda p: p[0])
+    out = []
+    for i, (t, v) in enumerate(pts):
+        prev_same = i > 0 and abs(pts[i - 1][1] - v) < 1e-9
+        next_same = i + 1 < len(pts) and abs(pts[i + 1][1] - v) < 1e-9
+        if prev_same and next_same:
+            continue
+        out.append({"time": round(t, 6), "value": v})
+    return out
+
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -657,6 +816,7 @@ class AbletonMCP(ControlSurface):
                         self.log_message(traceback.format_exc())
                         response_queue.put({"status": "error", "message": str(e)})
                 
+                main_thread_task = self._undo_grouped(main_thread_task)
                 # Schedule the task to run on the main thread
                 try:
                     self.schedule_message(0, main_thread_task)
@@ -735,6 +895,7 @@ class AbletonMCP(ControlSurface):
                         self.log_message(traceback.format_exc())
                         response_queue.put({"status": "error", "message": str(e)})
 
+                main_thread_task = self._undo_grouped(main_thread_task)
                 try:
                     self.schedule_message(0, main_thread_task)
                 except AssertionError:
@@ -750,6 +911,11 @@ class AbletonMCP(ControlSurface):
                 except queue.Empty:
                     response["status"] = "error"
                     response["message"] = "Timeout waiting for operation to complete"
+            elif command_type in V2_READ_COMMANDS:
+                handler = getattr(self, V2_READ_COMMANDS[command_type])
+                response["result"] = handler(params)
+            elif command_type in V2_MAIN_THREAD_COMMANDS:
+                response = self._run_v2_on_main_thread(command_type, params)
             else:
                 response["status"] = "error"
                 response["message"] = "Unknown command: " + command_type
@@ -761,6 +927,31 @@ class AbletonMCP(ControlSurface):
         
         return response
     
+    def _run_v2_on_main_thread(self, command_type, params):
+        """Run a 2.0 handler on Live's main thread and wait for its result."""
+        handler = getattr(self, V2_MAIN_THREAD_COMMANDS[command_type])
+        response_queue = queue.Queue()
+
+        def task():
+            try:
+                response_queue.put({"status": "success", "result": handler(params)})
+            except Exception as e:
+                self.log_message("Error in %s: %s" % (command_type, e))
+                self.log_message(traceback.format_exc())
+                response_queue.put({"status": "error", "message": str(e)})
+
+        if command_type not in V2_UNGROUPED_COMMANDS:
+            task = self._undo_grouped(task)
+        try:
+            self.schedule_message(0, task)
+        except AssertionError:
+            task()
+        try:
+            return response_queue.get(timeout=10.0)
+        except queue.Empty:
+            return {"status": "error",
+                    "message": "Timeout waiting for operation to complete"}
+
     # Command implementations
 
     def _get_script_info(self):
@@ -1099,7 +1290,15 @@ class AbletonMCP(ControlSurface):
                 clip.clear_envelope(param)
             envelope = clip.automation_envelope(param)
             if envelope is None:
-                envelope = clip.create_automation_envelope(param)
+                try:
+                    envelope = clip.create_automation_envelope(param)
+                except Exception as e:
+                    if clip_location == "arrangement":
+                        raise RuntimeError(
+                            "Live cannot create a new envelope for '%s' on an "
+                            "Arrangement clip (%s). Draw any automation for it "
+                            "in Live first, or write it on a Session clip." % (label, e))
+                    raise
             if envelope is None:
                 raise RuntimeError(
                     "Live cannot create an envelope for '%s' on this clip" % label)
@@ -1628,16 +1827,30 @@ class AbletonMCP(ControlSurface):
 
             clip = clip_slot.clip
 
-            # Duplicate to arrangement at the requested beat position
-            track.duplicate_clip_to_arrangement(clip, float(destination_time))
+            had_envelopes = bool(getattr(clip, "has_envelopes", False))
 
-            return {
+            # Duplicate to arrangement at the requested beat position
+            new_clip = track.duplicate_clip_to_arrangement(clip, float(destination_time))
+
+            result = {
                 "success": True,
                 "track_index": track_index,
                 "track_name": track.name,
                 "clip_name": clip.name,
                 "destination_time": destination_time
             }
+            # Live 12.4.5 sometimes drops clip envelopes here (seen on tracks
+            # with an instrument). Say so instead of failing silently.
+            if had_envelopes and new_clip is not None:
+                if not bool(getattr(new_clip, "has_envelopes", False)):
+                    result["automation_lost"] = True
+                    result["warning"] = (
+                        "The Session clip has automation, but the Arrangement "
+                        "copy has none (a known Live 12.4.5 issue on tracks "
+                        "with an instrument). The Live API cannot add new "
+                        "envelopes to Arrangement clips, so redraw it in Live "
+                        "or check the copy with get_clip_automation.")
+            return result
         except Exception as e:
             self.log_message("Error duplicating clip to arrangement: " + str(e))
             raise
@@ -1679,6 +1892,13 @@ class AbletonMCP(ControlSurface):
                     pass
 
             if existing is None:
+                song_length = float(getattr(song, "song_length", 0.0))
+                if target_time >= song_length:
+                    raise Exception(
+                        "Could not create a locator at beat %s: Live does not "
+                        "move the playhead past the song end (song_length %s). "
+                        "Put a clip there first (e.g. create_arrangement_clip) "
+                        "or choose an earlier time." % (target_time, song_length))
                 raise Exception("Failed to create cue at time " + str(target_time))
 
             if name:
@@ -1695,6 +1915,733 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error creating locator: " + str(e))
             raise
+
+    # ══ 2.0 command surface ══════════════════════════════════════════════
+    #
+    # Every 2.0 handler takes the raw params dict. Modifying handlers run on
+    # Live's main thread inside one undo step (see _undo_grouped), so a single
+    # Cmd+Z reverts a whole tool call.
+
+    def _undo_grouped(self, fn):
+        """Wrap ``fn`` in Song.begin_undo_step()/end_undo_step().
+
+        The pair is undocumented but present in Live 11/12; when it is missing
+        the call simply runs ungrouped.
+        """
+        def wrapped(*args, **kwargs):
+            song = self._song
+            begin = getattr(song, "begin_undo_step", None)
+            end = getattr(song, "end_undo_step", None)
+            started = False
+            if callable(begin) and callable(end):
+                try:
+                    begin()
+                    started = True
+                except Exception:
+                    started = False
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                if started:
+                    try:
+                        end()
+                    except Exception:
+                        pass
+        return wrapped
+
+    def _v2_track(self, params, allow_master=False):
+        """Resolve (track, track_type, index) from track_index/track_type."""
+        track_type = params.get("track_type", "track")
+        if track_type == "master":
+            if not allow_master:
+                raise ValueError("This command does not support the master track")
+            return self._song.master_track, "master", None
+        if track_type == "track":
+            tracks = self._song.tracks
+        elif track_type == "return":
+            tracks = self._song.return_tracks
+        else:
+            raise ValueError("track_type must be 'track', 'return'%s, got %s"
+                             % (" or 'master'" if allow_master else "",
+                                _short_repr(track_type)))
+        index = check_int("track_index", params.get("track_index"))
+        if index < 0 or index >= len(tracks):
+            raise IndexError("Track index %d out of range (%d %s track(s))"
+                             % (index, len(tracks), track_type))
+        return tracks[index], track_type, index
+
+    def _v2_scene(self, params, key="scene_index"):
+        index = check_int(key, params.get(key))
+        scenes = self._song.scenes
+        if index < 0 or index >= len(scenes):
+            raise IndexError("Scene index %d out of range (%d scene(s))"
+                             % (index, len(scenes)))
+        return scenes[index], index
+
+    @staticmethod
+    def _param_display(param, value=None):
+        try:
+            v = param.value if value is None else value
+            return str(param.str_for_value(v))
+        except Exception:
+            return None
+
+    # ── Mixer ─────────────────────────────────────────────────────────────
+
+    def _set_track_mixer(self, params):
+        track, track_type, index = self._v2_track(params, allow_master=True)
+        mixer = track.mixer_device
+        plan = []  # (label, apply_fn, read_fn)
+
+        def param_setter(label, param, value):
+            lo, hi = float(param.min), float(param.max)
+            value = check_number(label, value, lo, hi)
+            def apply():
+                param.value = value
+            def read():
+                return {"value": float(param.value),
+                        "display": self._param_display(param)}
+            plan.append((label, apply, read))
+
+        def attr_setter(label, attr, value, convert=None):
+            if not hasattr(track, attr):
+                raise ValueError("%s is not available on this %s track"
+                                 % (label, track_type))
+            def apply():
+                setattr(track, attr, value)
+            def read():
+                v = getattr(track, attr)
+                return convert(v) if convert else v
+            plan.append((label, apply, read))
+
+        if params.get("volume") is not None:
+            param_setter("volume", mixer.volume, params["volume"])
+        if params.get("panning") is not None:
+            param_setter("panning", mixer.panning, params["panning"])
+        for key in ("mute", "solo"):
+            if params.get(key) is not None:
+                if track_type == "master":
+                    raise ValueError("The master track has no %s" % key)
+                attr_setter(key, key, check_bool(key, params[key]), bool)
+        if params.get("arm") is not None:
+            arm = check_bool("arm", params["arm"])
+            if track_type != "track" or not getattr(track, "can_be_armed", False):
+                raise ValueError("This track cannot be armed (group, return "
+                                 "or master track)")
+            attr_setter("arm", "arm", arm, bool)
+        if params.get("monitoring") is not None:
+            if track_type != "track":
+                raise ValueError("Monitoring exists only on regular tracks")
+            state = lookup_choice("monitoring", params["monitoring"],
+                                  MONITORING_STATES)
+            attr_setter("monitoring", "current_monitoring_state", state, int)
+        if params.get("color_index") is not None:
+            attr_setter("color_index", "color_index",
+                        check_int("color_index", params["color_index"], 0, 69),
+                        int)
+        if not plan:
+            raise ValueError("Nothing to change: pass at least one of volume, "
+                             "panning, mute, solo, arm, monitoring, color_index")
+
+        changes = {}
+        for label, apply, read in plan:
+            before = read()
+            apply()
+            changes[label] = {"old": before, "new": read()}
+        return {"track_type": track_type, "track_index": index,
+                "track_name": str(track.name), "changes": changes}
+
+    # ── Track and scene management ───────────────────────────────────────
+
+    def _delete_track(self, params):
+        track, _, index = self._v2_track(params)
+        if len(self._song.tracks) <= 1:
+            raise ValueError("Live needs at least one track; cannot delete the last one")
+        name = str(track.name)
+        self._song.delete_track(index)
+        return {"deleted_index": index, "deleted_name": name,
+                "track_count": len(self._song.tracks)}
+
+    def _duplicate_track(self, params):
+        track, _, index = self._v2_track(params)
+        self._song.duplicate_track(index)
+        new_track = self._song.tracks[index + 1]
+        return {"source_index": index, "new_index": index + 1,
+                "new_name": str(new_track.name),
+                "track_count": len(self._song.tracks)}
+
+    def _delete_return_track(self, params):
+        index = check_int("return_index", params.get("return_index"))
+        returns = self._song.return_tracks
+        if index < 0 or index >= len(returns):
+            raise IndexError("Return index %d out of range (%d return track(s))"
+                             % (index, len(returns)))
+        name = str(returns[index].name)
+        self._song.delete_return_track(index)
+        return {"deleted_index": index, "deleted_name": name,
+                "return_track_count": len(self._song.return_tracks)}
+
+    def _create_scene(self, params):
+        index = check_int("index", params.get("index", -1), -1)
+        if index > len(self._song.scenes):
+            raise IndexError("Scene index %d out of range" % index)
+        self._song.create_scene(index)
+        new_index = len(self._song.scenes) - 1 if index == -1 else index
+        scene = self._song.scenes[new_index]
+        if params.get("name"):
+            scene.name = str(params["name"])
+        return {"index": new_index, "name": str(scene.name),
+                "scene_count": len(self._song.scenes)}
+
+    def _delete_scene(self, params):
+        scene, index = self._v2_scene(params)
+        if len(self._song.scenes) <= 1:
+            raise ValueError("Live needs at least one scene; cannot delete the last one")
+        name = str(scene.name)
+        self._song.delete_scene(index)
+        return {"deleted_index": index, "deleted_name": name,
+                "scene_count": len(self._song.scenes)}
+
+    def _duplicate_scene(self, params):
+        _, index = self._v2_scene(params)
+        self._song.duplicate_scene(index)
+        return {"source_index": index, "new_index": index + 1,
+                "new_name": str(self._song.scenes[index + 1].name),
+                "scene_count": len(self._song.scenes)}
+
+    def _fire_scene(self, params):
+        scene, index = self._v2_scene(params)
+        scene.fire()
+        return {"scene_index": index, "name": str(scene.name)}
+
+    def _set_scene_properties(self, params):
+        scene, index = self._v2_scene(params)
+        plan = []
+        if params.get("name") is not None:
+            plan.append(("name", str(params["name"])))
+        if params.get("tempo") is not None:
+            plan.append(("tempo", check_number("tempo", params["tempo"], 20.0, 999.0)))
+        if params.get("tempo_enabled") is not None:
+            plan.append(("tempo_enabled", check_bool("tempo_enabled", params["tempo_enabled"])))
+        if params.get("time_signature_numerator") is not None:
+            plan.append(("time_signature_numerator", check_int(
+                "time_signature_numerator", params["time_signature_numerator"], 1, 99)))
+        if params.get("time_signature_denominator") is not None:
+            den = check_int("time_signature_denominator",
+                            params["time_signature_denominator"])
+            if den not in (1, 2, 4, 8, 16):
+                raise ValueError("time_signature_denominator must be 1, 2, 4, 8 or 16")
+            plan.append(("time_signature_denominator", den))
+        if params.get("color_index") is not None:
+            plan.append(("color_index", check_int("color_index", params["color_index"], 0, 69)))
+        if not plan:
+            raise ValueError("Nothing to change")
+        for attr, value in plan:
+            setattr(scene, attr, value)
+        return {"scene_index": index, "name": str(scene.name),
+                "changed": [attr for attr, _ in plan],
+                "tempo": self._safe_attr(scene, "tempo", float),
+                "tempo_enabled": self._safe_attr(scene, "tempo_enabled", bool)}
+
+    # ── Clips ─────────────────────────────────────────────────────────────
+
+    def _v2_clip(self, params):
+        location = params.get("clip_location", "session")
+        return self._resolve_automation_clip(
+            params.get("track_index"), params.get("clip_index"), location)
+
+    def _set_clip_properties(self, params):
+        track, clip = self._v2_clip(params)
+        is_audio = bool(getattr(clip, "is_audio_clip", False))
+        simple = []
+
+        def want(key):
+            return params.get(key) is not None
+
+        if want("name"):
+            simple.append(("name", str(params["name"])))
+        for key in ("looping", "muted", "legato"):
+            if want(key):
+                simple.append((key, check_bool(key, params[key])))
+        if want("color_index"):
+            simple.append(("color_index", check_int("color_index", params["color_index"], 0, 69)))
+        if want("launch_mode"):
+            simple.append(("launch_mode", lookup_choice(
+                "launch_mode", params["launch_mode"], LAUNCH_MODES)))
+        if want("launch_quantization"):
+            simple.append(("launch_quantization", check_int(
+                "launch_quantization", params["launch_quantization"], 0, 14)))
+        if want("velocity_amount"):
+            simple.append(("velocity_amount", check_number(
+                "velocity_amount", params["velocity_amount"], 0.0, 1.0)))
+        audio_only = []
+        if want("gain"):
+            audio_only.append(("gain", check_number("gain", params["gain"], 0.0, 1.0)))
+        if want("pitch_coarse"):
+            audio_only.append(("pitch_coarse", check_int("pitch_coarse", params["pitch_coarse"], -48, 48)))
+        if want("pitch_fine"):
+            audio_only.append(("pitch_fine", check_number("pitch_fine", params["pitch_fine"], -50.0, 50.0)))
+        if want("warping"):
+            audio_only.append(("warping", check_bool("warping", params["warping"])))
+        if want("warp_mode"):
+            audio_only.append(("warp_mode", lookup_choice("warp_mode", params["warp_mode"], WARP_MODES)))
+        if audio_only and not is_audio:
+            raise ValueError("%s only apply to audio clips"
+                             % ", ".join(k for k, _ in audio_only))
+
+        ranges = []
+        for start_key, end_key in (("loop_start", "loop_end"),
+                                   ("start_marker", "end_marker")):
+            start = params.get(start_key)
+            end = params.get(end_key)
+            if start is None and end is None:
+                continue
+            start = None if start is None else check_number(start_key, start)
+            end = None if end is None else check_number(end_key, end)
+            new_start = start if start is not None else float(getattr(clip, start_key))
+            new_end = end if end is not None else float(getattr(clip, end_key))
+            if new_end <= new_start:
+                raise ValueError("%s (%s) must be after %s (%s)"
+                                 % (end_key, new_end, start_key, new_start))
+            ranges.append((start_key, start, end_key, end))
+
+        if not (simple or audio_only or ranges):
+            raise ValueError("Nothing to change")
+
+        for attr, value in simple + audio_only:
+            setattr(clip, attr, value)
+        for start_key, start, end_key, end in ranges:
+            # Live rejects a start at or after the current end (and vice
+            # versa), so move whichever side keeps the range valid first.
+            if start is not None and end is not None:
+                if start >= float(getattr(clip, end_key)):
+                    setattr(clip, end_key, end)
+                    setattr(clip, start_key, start)
+                else:
+                    setattr(clip, start_key, start)
+                    setattr(clip, end_key, end)
+            elif start is not None:
+                setattr(clip, start_key, start)
+            else:
+                setattr(clip, end_key, end)
+
+        state = {}
+        for key in ("name", "looping", "loop_start", "loop_end", "start_marker",
+                    "end_marker", "length", "muted", "launch_mode",
+                    "launch_quantization", "legato", "color_index"):
+            state[key] = self._safe_attr(clip, key)
+        if is_audio:
+            for key in ("gain", "pitch_coarse", "pitch_fine", "warping", "warp_mode"):
+                state[key] = self._safe_attr(clip, key)
+        return {"track_name": str(track.name),
+                "clip_location": params.get("clip_location", "session"),
+                "clip_index": params.get("clip_index"),
+                "changed": [k for k, _ in simple + audio_only]
+                           + [k for r in ranges for k in (r[0], r[2])
+                              if params.get(k) is not None],
+                "clip": state}
+
+    def _edit_clip(self, params):
+        action = params.get("action")
+        track, clip = self._v2_clip(params)
+        result = {"action": action, "track_name": str(track.name),
+                  "clip_name": str(clip.name)}
+        if action == "quantize":
+            grid = lookup_choice("grid", params.get("grid", "1/16"), QUANTIZE_GRIDS)
+            amount = check_number("amount", params.get("amount", 1.0), 0.0, 1.0)
+            clip.quantize(grid, amount)
+            result.update({"grid": params.get("grid", "1/16"), "amount": amount})
+        elif action == "crop":
+            clip.crop()
+        elif action == "duplicate_loop":
+            clip.duplicate_loop()
+        elif action == "duplicate_region":
+            if not getattr(clip, "is_midi_clip", False):
+                raise ValueError("duplicate_region works on MIDI clips only")
+            start = check_number("region_start", params.get("region_start"))
+            length = check_number("region_length", params.get("region_length"))
+            if length <= 0:
+                raise ValueError("region_length must be > 0")
+            dest = check_number("destination_time", params.get("destination_time"))
+            pitch = check_int("pitch", params.get("pitch", -1), -1, 127)
+            transpose = check_int("transposition", params.get("transposition", 0), -127, 127)
+            clip.duplicate_region(start, length, dest, pitch, transpose)
+            result.update({"region_start": start, "region_length": length,
+                           "destination_time": dest})
+        elif action == "duplicate_slot":
+            if params.get("clip_location", "session") != "session":
+                raise ValueError("duplicate_slot works on Session clips only")
+            new_index = track.duplicate_clip_slot(params.get("clip_index"))
+            result["new_clip_index"] = int(new_index)
+        else:
+            raise ValueError("action must be one of quantize, crop, duplicate_loop, "
+                             "duplicate_region, duplicate_slot; got %s"
+                             % _short_repr(action))
+        for key in ("length", "loop_start", "loop_end"):
+            result[key] = self._safe_attr(clip, key, float)
+        return result
+
+    # ── Arrangement clips ────────────────────────────────────────────────
+
+    def _create_arrangement_clip(self, params):
+        """Create a clip directly in the Arrangement (Track.create_midi_clip /
+        Track.create_audio_clip), without the Session detour."""
+        track, _, index = self._v2_track(params)
+        start = check_number("start_time", params.get("start_time"), 0.0)
+        path = params.get("path")
+        notes = params.get("notes")
+        if path:
+            if notes:
+                raise ValueError("notes cannot be added to an audio clip")
+            if not getattr(track, "has_audio_input", False):
+                raise ValueError("Audio clips need an audio track")
+            if not hasattr(track, "create_audio_clip"):
+                raise RuntimeError("Track.create_audio_clip needs Live 12.0 or newer")
+            path = str(path)
+            if not os.path.isabs(path) or not os.path.isfile(path):
+                raise ValueError("path must be an absolute path to an existing audio file")
+            clip = track.create_audio_clip(path, start)
+        else:
+            length = check_number("length", params.get("length", 4.0), 0.0)
+            if length <= 0:
+                raise ValueError("length must be > 0")
+            if not getattr(track, "has_midi_input", False):
+                raise ValueError("MIDI clips need a MIDI track (pass path for an audio clip)")
+            if not hasattr(track, "create_midi_clip"):
+                raise RuntimeError("Track.create_midi_clip needs Live 12.0 or newer")
+            specs = normalize_note_specs(notes) if notes else []
+            clip = track.create_midi_clip(start, length)
+            if specs:
+                import Live
+                clip.add_new_notes(tuple(
+                    Live.Clip.MidiNoteSpecification(**s) for s in specs))
+        if params.get("name"):
+            clip.name = str(params["name"])
+        clip_index = None
+        for i, c in enumerate(track.arrangement_clips):
+            if c == clip or abs(float(c.start_time) - start) < 1e-6:
+                clip_index = i
+                break
+        return {"track_index": index, "track_name": str(track.name),
+                "clip_index": clip_index, "name": str(clip.name),
+                "start_time": float(clip.start_time),
+                "end_time": float(clip.end_time),
+                "is_audio_clip": bool(getattr(clip, "is_audio_clip", False)),
+                "note_count": len(notes) if notes else 0}
+
+    def _delete_arrangement_clip(self, params):
+        track, clip = self._resolve_automation_clip(
+            params.get("track_index"), params.get("clip_index"), "arrangement")
+        info = {"name": str(clip.name), "start_time": float(clip.start_time)}
+        track.delete_clip(clip)
+        info["remaining_clips"] = len(track.arrangement_clips)
+        return info
+
+    # ── Automation read-back ─────────────────────────────────────────────
+
+    def _parameter_catalog(self, track):
+        """[(param, descriptor)] for every automatable parameter on a track."""
+        out = []
+        mixer = track.mixer_device
+        out.append((mixer.volume, {"parameter_type": "volume", "label": "Volume"}))
+        out.append((mixer.panning, {"parameter_type": "panning", "label": "Pan"}))
+        for i, send in enumerate(mixer.sends):
+            out.append((send, {"parameter_type": "send", "send_index": i,
+                               "label": "Send %s" % str(getattr(send, "name", i))}))
+        for d_i, device in enumerate(track.devices):
+            for p_i, p in enumerate(device.parameters):
+                out.append((p, {"parameter_type": "device", "device_index": d_i,
+                                "parameter_index": p_i,
+                                "label": "%s: %s" % (str(device.name), str(p.name))}))
+        return out
+
+    def _read_envelope(self, envelope, clip, param, sample_step):
+        end = max(float(clip.length), float(self._safe_attr(clip, "loop_end", float, 0.0)),
+                  float(self._safe_attr(clip, "end_marker", float, 0.0)))
+        data = {"min": float(param.min), "max": float(param.max)}
+        events = None
+        if hasattr(envelope, "events_in_range"):
+            try:
+                raw = envelope.events_in_range(0.0, end)
+                events = [(float(e.time), float(e.value)) for e in raw]
+            except Exception:
+                events = None
+        if events is not None:
+            data["raw_event_count"] = len(events)
+            points = compress_envelope_events(events)
+            data["truncated"] = len(points) > MAX_ENVELOPE_EVENTS
+            data["points"] = points[:MAX_ENVELOPE_EVENTS]
+        if sample_step is not None or events is None:
+            step = check_number("sample_step", sample_step if sample_step is not None else 0.25,
+                                MIN_AUTOMATION_RESOLUTION)
+            n = min(int(end / step) + 1, MAX_ENVELOPE_EVENTS)
+            data["samples"] = [{"time": round(k * step, 6),
+                                "value": float(envelope.value_at_time(k * step))}
+                               for k in range(n)]
+        return data
+
+    def _get_clip_automation(self, params):
+        """Read clip envelopes back: breakpoints via Envelope.events_in_range,
+        optional regular samples via value_at_time."""
+        track, clip = self._v2_clip(params)
+        parameter_type = params.get("parameter_type", "all")
+        sample_step = params.get("sample_step")
+        result = {"track_name": str(track.name), "clip_name": str(clip.name),
+                  "clip_location": params.get("clip_location", "session"),
+                  "clip_length": float(clip.length),
+                  "has_envelopes": self._safe_attr(clip, "has_envelopes", bool)}
+        if parameter_type == "all":
+            catalog = self._parameter_catalog(track)
+            envelopes = []
+            if hasattr(clip, "automation_envelopes"):
+                found = list(clip.automation_envelopes)
+                for env in found:
+                    param = env.parameter
+                    desc = {"label": str(getattr(param, "name", "?"))}
+                    for p, d in catalog:
+                        if p == param:
+                            desc = dict(d)
+                            break
+                    desc.update(self._read_envelope(env, clip, param, sample_step))
+                    envelopes.append(desc)
+            else:
+                # Older Live: probe every parameter on the track.
+                for p, d in catalog:
+                    env = clip.automation_envelope(p)
+                    if env is not None:
+                        desc = dict(d)
+                        desc.update(self._read_envelope(env, clip, p, sample_step))
+                        envelopes.append(desc)
+            result["envelopes"] = envelopes
+            return result
+        param, label = self._resolve_automation_parameter(
+            track, parameter_type, params.get("device_index"),
+            params.get("parameter_index"), params.get("send_index"))
+        env = clip.automation_envelope(param)
+        result["parameter"] = label
+        if env is None:
+            result["envelopes"] = []
+            return result
+        desc = {"label": label, "parameter_type": parameter_type}
+        desc.update(self._read_envelope(env, clip, param, sample_step))
+        result["envelopes"] = [desc]
+        return result
+
+    # ── Devices without the browser ──────────────────────────────────────
+
+    def _insert_device(self, params):
+        """Track.insert_device(name, index): native Live devices by name,
+        no browser walk (Live 12.3+)."""
+        track, track_type, index = self._v2_track(params, allow_master=True)
+        name = params.get("device_name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("device_name must be a non-empty string, e.g. 'EQ Eight'")
+        position = check_int("device_index", params.get("device_index", -1), -1)
+        if not hasattr(track, "insert_device"):
+            raise RuntimeError("Track.insert_device needs Live 12.3 or newer; use "
+                               "load_instrument_or_effect with a browser URI instead")
+        before = len(track.devices)
+        if position > before:
+            raise IndexError("device_index %d out of range (track has %d device(s))"
+                             % (position, before))
+        try:
+            device = track.insert_device(name.strip(), position)
+        except Exception as e:
+            raise RuntimeError(
+                "Live could not insert %s: %s. insert_device takes native Live "
+                "devices by their browser name (e.g. 'Operator', 'Drift', "
+                "'EQ Eight', 'Auto Filter', 'Compressor'); plug-ins, presets "
+                "and Max devices still need load_instrument_or_effect."
+                % (_short_repr(name), e))
+        devices = list(track.devices)
+        new_index = position if position >= 0 else len(devices) - 1
+        for i, d in enumerate(devices):
+            if device is not None and d == device:
+                new_index = i
+                break
+        new = devices[new_index]
+        return {"track_type": track_type, "track_index": index,
+                "track_name": str(track.name), "device_index": new_index,
+                "device_name": str(new.name),
+                "class_name": str(getattr(new, "class_name", "")),
+                "parameter_count": len(list(new.parameters)),
+                "device_count": len(devices)}
+
+    # ── Scale ────────────────────────────────────────────────────────────
+
+    def _known_scale_names(self):
+        try:
+            import Live
+            raw = Live.Song.get_all_scales_ordered()
+            names = []
+            for entry in raw:
+                if isinstance(entry, str):
+                    names.append(entry)
+                elif isinstance(entry, (tuple, list)) and entry and isinstance(entry[0], str):
+                    names.append(entry[0])
+            if names:
+                return names
+        except Exception:
+            pass
+        return list(DEFAULT_SCALE_NAMES)
+
+    def _read_scale(self, params=None):
+        song = self._song
+        root = self._safe_attr(song, "root_note", int, 0)
+        intervals = list(getattr(song, "scale_intervals", []) or [])
+        result = {
+            "root_note": root,
+            "root_name": NOTE_NAMES[root % 12],
+            "scale_name": self._safe_attr(song, "scale_name", str),
+            "scale_mode": self._safe_attr(song, "scale_mode", bool),
+            "scale_intervals": [int(i) for i in intervals],
+            "note_names": scale_note_names(root, intervals),
+        }
+        if params and params.get("include_available"):
+            result["available_scales"] = self._known_scale_names()
+        return result
+
+    def _set_scale(self, params):
+        song = self._song
+        plan = []
+        if params.get("root_note") is not None:
+            plan.append(("root_note", parse_root_note(params["root_note"])))
+        if params.get("scale_name") is not None:
+            plan.append(("scale_name", match_scale_name(
+                params["scale_name"], self._known_scale_names())))
+        if params.get("scale_mode") is not None:
+            plan.append(("scale_mode", check_bool("scale_mode", params["scale_mode"])))
+        if not plan:
+            raise ValueError("Nothing to change: pass root_note, scale_name or scale_mode")
+        old = self._read_scale()
+        for attr, value in plan:
+            if not hasattr(song, attr):
+                raise RuntimeError("Song.%s needs Live 12 or newer" % attr)
+            setattr(song, attr, value)
+        return {"old": old, "new": self._read_scale()}
+
+    # ── Transport ────────────────────────────────────────────────────────
+
+    def _get_transport(self, params=None):
+        song = self._song
+        s = lambda attr, cast=None: self._safe_attr(song, attr, cast)
+        return {
+            "is_playing": s("is_playing", bool),
+            "current_song_time": s("current_song_time", float),
+            "tempo": s("tempo", float),
+            "signature_numerator": s("signature_numerator", int),
+            "signature_denominator": s("signature_denominator", int),
+            "loop": s("loop", bool),
+            "loop_start": s("loop_start", float),
+            "loop_length": s("loop_length", float),
+            "song_length": s("song_length", float),
+            "metronome": s("metronome", bool),
+            "record_mode": s("record_mode", bool),
+            "arrangement_overdub": s("arrangement_overdub", bool),
+            "session_record": s("session_record", bool),
+            "punch_in": s("punch_in", bool),
+            "punch_out": s("punch_out", bool),
+            "clip_trigger_quantization": s("clip_trigger_quantization", int),
+            "swing_amount": s("swing_amount", float),
+            "can_undo": s("can_undo", bool),
+            "can_redo": s("can_redo", bool),
+            "can_capture_midi": s("can_capture_midi", bool),
+            "cue_points": [{"name": str(c.name), "time": float(c.time)}
+                           for c in getattr(song, "cue_points", [])],
+        }
+
+    def _set_transport(self, params):
+        song = self._song
+        plan = []
+        for key in ("loop", "metronome", "record_mode", "arrangement_overdub",
+                    "session_record", "punch_in", "punch_out"):
+            if params.get(key) is not None:
+                plan.append((key, check_bool(key, params[key])))
+        if params.get("loop_start") is not None:
+            plan.append(("loop_start", check_number("loop_start", params["loop_start"], 0.0)))
+        if params.get("loop_length") is not None:
+            length = check_number("loop_length", params["loop_length"], 0.0)
+            if length <= 0:
+                raise ValueError("loop_length must be > 0")
+            plan.append(("loop_length", length))
+        if params.get("signature_numerator") is not None:
+            plan.append(("signature_numerator", check_int(
+                "signature_numerator", params["signature_numerator"], 1, 99)))
+        if params.get("signature_denominator") is not None:
+            den = check_int("signature_denominator", params["signature_denominator"])
+            if den not in (1, 2, 4, 8, 16):
+                raise ValueError("signature_denominator must be 1, 2, 4, 8 or 16")
+            plan.append(("signature_denominator", den))
+        if params.get("clip_trigger_quantization") is not None:
+            plan.append(("clip_trigger_quantization", check_int(
+                "clip_trigger_quantization", params["clip_trigger_quantization"], 0, 13)))
+        if params.get("swing_amount") is not None:
+            plan.append(("swing_amount", check_number(
+                "swing_amount", params["swing_amount"], 0.0, 1.0)))
+        if not plan:
+            raise ValueError("Nothing to change")
+        for attr, value in plan:
+            setattr(song, attr, value)
+        state = self._get_transport()
+        warnings = []
+        for attr, value in plan:
+            actual = state.get(attr)
+            if isinstance(value, float) and actual is not None and abs(actual - value) > 1e-6:
+                warnings.append(
+                    "%s is %s, not %s: Live does not place the loop beyond the "
+                    "song end (song_length %s). Add clips further out or use a "
+                    "shorter loop." % (attr, actual, value, state.get("song_length")))
+        return {"changed": [a for a, _ in plan], "state": state,
+                "warnings": warnings}
+
+    def _transport_action(self, params):
+        song = self._song
+        action = params.get("action")
+        if action == "continue_playing":
+            song.continue_playing()
+        elif action == "stop_all_clips":
+            song.stop_all_clips(bool(params.get("quantized", True)))
+        elif action == "jump_by":
+            song.jump_by(check_number("beats", params.get("beats")))
+        elif action == "jump_to_next_cue":
+            if not song.can_jump_to_next_cue:
+                raise ValueError("No locator after the current position")
+            song.jump_to_next_cue()
+        elif action == "jump_to_prev_cue":
+            if not song.can_jump_to_prev_cue:
+                raise ValueError("No locator before the current position")
+            song.jump_to_prev_cue()
+        elif action == "tap_tempo":
+            song.tap_tempo()
+        elif action == "capture_midi":
+            if not getattr(song, "can_capture_midi", False):
+                raise ValueError("Nothing to capture: play some MIDI into an armed "
+                                 "or monitored track first")
+            song.capture_midi()
+        elif action == "re_enable_automation":
+            song.re_enable_automation()
+        else:
+            raise ValueError("action must be one of continue_playing, stop_all_clips, "
+                             "jump_by, jump_to_next_cue, jump_to_prev_cue, tap_tempo, "
+                             "capture_midi, re_enable_automation; got %s"
+                             % _short_repr(action))
+        return {"action": action,
+                "current_song_time": self._safe_attr(song, "current_song_time", float),
+                "is_playing": self._safe_attr(song, "is_playing", bool)}
+
+    def _undo(self, params=None):
+        if not self._song.can_undo:
+            raise ValueError("Nothing to undo")
+        self._song.undo()
+        return {"can_undo": bool(self._song.can_undo),
+                "can_redo": bool(self._song.can_redo)}
+
+    def _redo(self, params=None):
+        if not self._song.can_redo:
+            raise ValueError("Nothing to redo")
+        self._song.redo()
+        return {"can_undo": bool(self._song.can_undo),
+                "can_redo": bool(self._song.can_redo)}
 
     # ── Browser implementations ───────────────────────────────────────────────
 
