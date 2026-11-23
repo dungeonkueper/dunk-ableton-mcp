@@ -256,7 +256,14 @@ Once the config file has been set on Claude, and the remote script is running in
 - Add notes to MIDI clips
 - Change tempo and other session parameters
 - Create return tracks and set send levels
-- Write clip automation (e.g. filter sweeps, volume or send rides)
+- Write clip automation (e.g. filter sweeps, volume or send rides) and read it back
+- Scenes: launch, scene tempo, time signature and color; delete return tracks
+- Edit clips: loop and markers, launch settings, audio gain/pitch/warp, quantize, crop, duplicate loop or region
+- Transport: arrangement loop, record/punch, launch quantization, locator jumps, capture MIDI
+- `undo` / `redo` tools
+- Create clips directly in the Arrangement (MIDI with notes, or audio files)
+- Insert Live's own devices by name, without a browser search (Live 12.3+)
+- Read and set the Set's key and scale (Live 12 Scale Mode)
 
 ### Example Commands
 
@@ -275,6 +282,10 @@ Here are some examples of what you can ask Claude to do:
 | *"Add a jazz chord progression to the clip in track 1"* | |
 | *"Set the tempo to 120 BPM"* | |
 | *"Play the clip in track 2"* | |
+| *"Set the song to D Dorian and write a bassline that stays in the scale"* | |
+| *"Put an 8-bar MIDI clip at bar 17 on the bass track and add an EQ Eight"* | |
+| *"Loop bars 9 to 16 and turn on punch in"* | |
+| *"Show me the filter automation in the lead clip"* | |
 
 ---
 
@@ -302,6 +313,24 @@ The system uses a simple JSON-based protocol over TCP sockets:
 - Always save your work before extensive experimentation
 
 ### Fork changelog (dungeonkueper/dunk-ableton-mcp)
+
+**Remote Script 2.0.0+dunk.1** (based on upstream 1.9.0 + 1.9.0+dunk.1; update the Remote Script together with the server; Live 12 recommended)
+
+Upstream already covers mixer (`set_track_mixer`, incl. sends), transport and song settings (`get_transport`, `set_song_settings`, `stop_all_clips`, `jump_to_cue`), track/scene create/duplicate/delete/rename (`edit_structure`) and an undo step per command. 2.0 adds only what upstream lacks; all 2.0 commands go through upstream's main-thread queue, undo step and safety policy.
+
+- `undo` / `redo` (safety category `undo`).
+- `delete_return_track` (`delete`, off by default), `fire_scene` (`playback`), `set_scene_properties` (name, tempo, tempo on/off, time signature, color).
+- `set_clip_properties`: loop on/off, loop start/end, start/end markers, mute, color, launch mode and quantization, legato, velocity amount; for audio clips gain, pitch, warping and warp mode. Session and Arrangement clips.
+- `edit_clip(action=...)`: `quantize` (notes; grid and strength), `crop`, `duplicate_loop`, `duplicate_region` (MIDI), `duplicate_slot` (Session).
+- `set_transport`: only what `set_song_settings` leaves out: loop on/off and range, record mode, session record, punch in/out, global launch quantization. Tempo, signature, metronome, overdub and swing are refused with a pointer to `set_song_settings`.
+- `transport_action` (`playback`): continue playing, jump by beats, jump to next/previous locator, tap tempo, capture MIDI, re-enable automation.
+- `create_arrangement_clip(track_index, start_time, length, path, name, notes)` (`structure`): creates a clip directly in the Arrangement with `Track.create_midi_clip` / `Track.create_audio_clip` (Live 12). `delete_arrangement_clip` (`delete`, off by default).
+- `get_clip_automation`: reads clip envelopes back (`Envelope.events_in_range`, `value_at_time`), with the parameter indices `set_clip_automation` takes.
+- `insert_device(track_index, device_name, device_index)` (`structure`): native Live devices by name via `Track.insert_device` (Live 12.3+).
+- `read_scale` / `set_scale`: key and scale of the Set, including `scale_name` (which `set_song_settings` cannot set) and the note names in the scale. `root_note` takes "F#", "Bb" or 0–11.
+- `duplicate_to_arrangement` warns when the Arrangement copy lost the Session clip's automation (Live 12.4.5); `set_clip_automation` on an Arrangement clip explains that Live cannot create a new envelope there.
+
+Dropped from the original 2.0 draft because upstream has them: `set_track_mixer` (2.0 also set monitoring and color; upstream does not yet), `get_transport`, `delete_track`, `duplicate_track`, `create_scene`, `delete_scene`, `duplicate_scene`, the `stop_all_clips` action and 2.0's own undo grouping.
 
 **Remote Script 1.9.0+dunk.1** (based on upstream 1.9.0; update the Remote Script together with the server)
 

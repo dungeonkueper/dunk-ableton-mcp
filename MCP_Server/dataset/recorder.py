@@ -61,6 +61,11 @@ _IMPLICIT_TRACKED_TOOLS = frozenset({
     "set_send",
     "set_clip_automation",
     "clear_clip_automation",
+    "set_clip_properties",
+    "edit_clip",
+    "create_arrangement_clip",
+    "insert_device",
+    "set_scale",
 })
 
 # An edit undone within this many seconds reads as a rejection
