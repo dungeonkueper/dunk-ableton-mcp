@@ -9,6 +9,8 @@ _TOOL_LEVELS: dict[str, tuple[int, str]] = {
     "set_tempo": (1, "adjust_tempo"),
     "set_device_parameter": (1, "adjust_parameter"),
     "set_send": (1, "adjust_send"),
+    "set_clip_automation": (2, "write_automation"),
+    "clear_clip_automation": (2, "write_automation"),
     "set_track_name": (1, "rename_track"),
     "set_clip_name": (1, "rename_clip"),
     "set_arrangement_clip_name": (1, "rename_clip"),

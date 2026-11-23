@@ -59,6 +59,8 @@ _IMPLICIT_TRACKED_TOOLS = frozenset({
     "duplicate_to_arrangement",
     "set_device_parameter",
     "set_send",
+    "set_clip_automation",
+    "clear_clip_automation",
 })
 
 # An edit undone within this many seconds reads as a rejection
