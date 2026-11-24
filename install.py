@@ -45,6 +45,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -380,6 +381,71 @@ def resolve_remote(repo: str, ref: str) -> Tuple[str, str]:
     raise InstallError(f"No branch, tag or PR named {ref!r} on {repo}")
 
 
+PR_REF_RE = re.compile(r"refs/pull/(\d+)/head")
+
+
+def github_slug(repo: str) -> Optional[Tuple[str, str]]:
+    """('owner', 'name') for a github.com URL, else None."""
+    m = re.fullmatch(r"(?:https://|git@|ssh://git@)github\.com[/:]([\w.-]+)/([\w.-]+?)(?:\.git)?/?", repo.strip())
+    return (m.group(1), m.group(2)) if m else None
+
+
+def pr_origin(repo: str, number: int, timeout: float = 5.0) -> Optional[Dict]:
+    """Who opened a pull request and from which repository (GitHub API, best effort).
+
+    Returns None when the repo is not on github.com or the API cannot be
+    reached; the caller then warns without the details.
+    """
+    slug = github_slug(repo)
+    if slug is None:
+        return None
+    url = f"https://api.github.com/repos/{slug[0]}/{slug[1]}/pulls/{number}"
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json",
+                                               "User-Agent": "dunk-ableton-mcp-installer"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    head_repo = ((data.get("head") or {}).get("repo") or {}).get("full_name")
+    return {
+        "author": (data.get("user") or {}).get("login"),
+        "head_repo": head_repo,  # None when the fork was deleted
+        "base_repo": f"{slug[0]}/{slug[1]}",
+        "state": data.get("state"),
+        "merged": bool(data.get("merged_at")),
+    }
+
+
+def pr_warning(repo: str, remote_ref: str) -> List[str]:
+    """Plan lines that warn before code from a pull request is installed."""
+    m = PR_REF_RE.fullmatch(remote_ref)
+    if not m:
+        return []
+    number = int(m.group(1))
+    lines = [
+        f"!! Pull request #{number}: installing it runs the PR's code on this computer:",
+        "   uv sync (build step), the MCP server, and the Remote Script inside Live.",
+        "   Anyone can open a pull request on a public repository.",
+    ]
+    info = pr_origin(repo, number)
+    if info is None:
+        lines.append("   Author unknown (GitHub not reachable). Check the PR on GitHub before you confirm.")
+        return lines
+    who = f"@{info['author']}" if info.get("author") else "an unknown account"
+    head = info.get("head_repo")
+    if head is None:
+        src = "a fork that no longer exists"
+    elif head.lower() == info["base_repo"].lower():
+        src = f"a branch of {head}"
+    else:
+        src = f"the FORK {head} (not {info['base_repo']})"
+    state = "merged" if info.get("merged") else (info.get("state") or "unknown state")
+    lines.append(f"   Opened by {who} from {src}; {state}.")
+    lines.append("   Only confirm if you trust this author and have read the changes.")
+    return lines
+
+
 def ensure_cache(home: Path, repo: str) -> Path:
     cache = home / "repo.git"
     if not (cache / "HEAD").is_file():
@@ -573,6 +639,12 @@ class Installer:
 
         for i, s in enumerate(steps, 1):
             print(f"  {i}. {s}")
+        if not switch_only:
+            warning = pr_warning(self.repo, remote_ref)
+            if warning:
+                print()
+                for line in warning:
+                    print(f"  {line}")
         live = query_live(timeout=0.5)
         if live is not None:
             print()

@@ -123,6 +123,8 @@ The resulting server command is `uv run --frozen --directory ~/.dunk-ableton-mcp
 
 **After every switch:** restart Ableton Live (or re-select AbletonMCP under Settings → Link, Tempo & MIDI) and restart your MCP client. `--status` shows whether Live already runs the new Remote Script.
 
+**Pull requests.** `--ref pr/N` installs code that may not be reviewed yet, and anyone can open a pull request on a public repository. The plan therefore shows a warning with the PR's author and whether it comes from a fork (looked up on the GitHub API; if that is not reachable, the warning says so). Only confirm a PR from someone you trust.
+
 **Windows and odd setups.** Links are symlinks; on Windows without Developer Mode the installer uses directory junctions, which need no admin rights. If the Remote Script cannot be linked it is copied instead (`--copy` forces this, `--link` switches back). If your User Library is not found, pass `--remote-scripts "<User Library>/Remote Scripts"` once; it is remembered.
 
 ---

@@ -224,3 +224,44 @@ def test_configure_claude_desktop_keeps_env(env, monkeypatch):
 def test_slug():
     assert inst.slug_for("pr/3") == "pr-3"
     assert inst.slug_for("feature/foo bar") == "feature-foo-bar"
+
+
+def test_github_slug():
+    assert inst.github_slug("https://github.com/dungeonkueper/dunk-ableton-mcp.git") == ("dungeonkueper", "dunk-ableton-mcp")
+    assert inst.github_slug("git@github.com:a/b.git") == ("a", "b")
+    assert inst.github_slug("https://github.com/a/b") == ("a", "b")
+    assert inst.github_slug("/tmp/local/repo") is None
+    assert inst.github_slug("https://example.com/a/b.git") is None
+
+
+def test_pr_warning_only_for_pull_requests(monkeypatch):
+    monkeypatch.setattr(inst, "pr_origin", lambda repo, n: None)
+    assert inst.pr_warning("x", "refs/heads/main") == []
+    assert inst.pr_warning("x", "refs/tags/v1.8.0") == []
+    lines = inst.pr_warning("x", "refs/pull/7/head")
+    assert "Pull request #7" in lines[0]
+    assert "Author unknown" in lines[-1]
+
+
+def test_pr_warning_names_fork_and_author(monkeypatch):
+    info = {"author": "mallory", "head_repo": "mallory/dunk-ableton-mcp",
+            "base_repo": "dungeonkueper/dunk-ableton-mcp", "state": "open", "merged": False}
+    monkeypatch.setattr(inst, "pr_origin", lambda repo, n: info)
+    text = "\n".join(inst.pr_warning("x", "refs/pull/7/head"))
+    assert "@mallory" in text and "FORK mallory/dunk-ableton-mcp" in text and "open" in text
+
+    info = dict(info, author="dungeonkueper", head_repo="dungeonkueper/dunk-ableton-mcp")
+    text = "\n".join(inst.pr_warning("x", "refs/pull/7/head"))
+    assert "a branch of dungeonkueper/dunk-ableton-mcp" in text and "FORK" not in text
+
+    info = dict(info, head_repo=None)
+    assert "no longer exists" in "\n".join(inst.pr_warning("x", "refs/pull/7/head"))
+
+
+def test_plan_shows_pr_warning(env, monkeypatch, capsys):
+    monkeypatch.setattr(inst, "pr_origin", lambda repo, n: None)
+    assert env.run("--ref", "pr/3", "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "Pull request #3: installing it runs" in out
+    assert env.run("--ref", "main", "--dry-run") == 0
+    assert "Pull request #" not in capsys.readouterr().out
