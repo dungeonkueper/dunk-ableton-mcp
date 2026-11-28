@@ -20,7 +20,7 @@ A switch therefore only moves the ``current`` link.
 
 Examples:
 
-    python install.py --ref main            # 1.8.x
+    python install.py --ref main            # upstream state (Remote Script 1.9.x)
     python install.py --ref v2.0            # branch
     python install.py --ref pr/3            # pull request #3
     python install.py --ref v2.0 --dry-run  # plan only

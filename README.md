@@ -87,7 +87,7 @@ That's it — ask Claude to build something.
 ```bash
 curl -O https://raw.githubusercontent.com/dungeonkueper/dunk-ableton-mcp/main/install.py
 
-python3 install.py --ref main            # current release line (1.8.x)
+python3 install.py --ref main            # upstream state (Remote Script 1.9.x)
 python3 install.py --ref v2.0            # a branch
 python3 install.py --ref pr/3            # a pull request
 python3 install.py --ref v2.0 --dry-run  # plan only, changes nothing
