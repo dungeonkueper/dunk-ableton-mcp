@@ -1633,6 +1633,8 @@ def record_audition(
 
 from .integration_tools import register_tools as _register_integration_tools
 _register_integration_tools(mcp, get_ableton_connection)
+from .registry_tools import register_registry_tools as _register_registry_tools
+_register_registry_tools(mcp, get_ableton_connection)
 
 
 @mcp.tool()
