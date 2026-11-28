@@ -382,6 +382,10 @@ Install `ableton-mcp[audio]` for NumPy-based WAV analysis. Core startup does not
 
 `record_audio` records at most 30 seconds. Analysis accepts temporary 16-bit WAVs up to 120 seconds, 8 channels and 4 million samples, whichever limit is reached first. Recording and analysis run off the event loop. Failed/cancelled captures clean their owned temporary output; successful recordings last until analysis or server shutdown. Existing output paths are never overwritten. Real capture support remains unverified until tested with the user's configured loopback device.
 
+### Live mix listening (fork prototype)
+
+With `ableton-mcp[analysis]` installed, a Max for Live analyzer (`m4l/MixEars.maxpat`) can stream levels and a 1/3-octave spectrum to the server over local UDP. Tools: `get_mix_analysis`, `compare_to_reference`, `save_reference_profile`, `get_masking_report`, `apply_eq_suggestions` (EQ Eight via the device registry) and `get_mix_spectrogram`. Not yet tested in Live; see [docs/mix-ears.md](docs/mix-ears.md).
+
 ### Offline analysis and MIDI previews
 
 Install `ableton-mcp[analysis]` to enable `analyze_audio_file` (NumPy, SciPy and soundfile). It reads an existing file without rendering or changing Live. Limits are 128 MiB per file, 120 seconds per selected segment, 6 million decoded samples and 8 channels. Loudness/spectrum measurements are reported separately from heuristic tempo, tonality and mix advice.

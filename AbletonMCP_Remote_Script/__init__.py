@@ -1592,7 +1592,9 @@ class AbletonMCP(ControlSurface):
             middle = (low + high) / 2
             if (read(middle) < target) == increasing: low = middle
             else: high = middle
-        value = (low + high) / 2
+        # The display is rounded (e.g. "8.00 kHz"), so the midpoint can sit just
+        # below a step; take whichever bracket end reads closest to the target.
+        value = min((low, (low + high) / 2, high), key=lambda v: abs(read(v) - target))
         if abs(read(value) - target) > max(1e-6, abs(target) * .001):
             raise ValueError("Display value cannot be resolved without ambiguity")
         return value
