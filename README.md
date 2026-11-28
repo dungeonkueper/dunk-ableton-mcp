@@ -80,6 +80,55 @@ That's it — ask Claude to build something.
 
 ---
 
+## Installing and switching versions of this fork (`install.py`)
+
+`install.py` installs any branch, tag or pull request of this fork side by side and switches between them. You run it yourself; it prints a plan (what is active now, what comes next, which paths change) and only continues after you answer `y`. It needs Python 3.8+, git and [uv](https://docs.astral.sh/uv/), nothing else.
+
+```bash
+curl -O https://raw.githubusercontent.com/dungeonkueper/dunk-ableton-mcp/main/install.py
+
+python3 install.py --ref main            # upstream state (Remote Script 1.9.x)
+python3 install.py --ref v2.0            # a branch
+python3 install.py --ref pr/3            # a pull request
+python3 install.py --ref v2.0 --dry-run  # plan only, changes nothing
+python3 install.py --list                # installed versions (* active, < previous)
+python3 install.py --switch main         # activate an installed version without fetching
+python3 install.py --rollback            # back to the previous version
+python3 install.py --status              # links, versions, and what Live reports
+python3 install.py --remove pr-3         # delete an inactive version
+```
+
+After the first run the installer keeps a copy of itself at `~/.dunk-ableton-mcp/install.py`. On Windows, use `py install.py …`.
+
+**How it works.** Everything lives in `~/.dunk-ableton-mcp` (override with `DUNK_MCP_HOME`); your own git checkout is never touched.
+
+| Path | What it is |
+|---|---|
+| `versions/<name>/` | one git worktree per branch/tag/PR (`pr/3` becomes `pr-3`), with its own `.venv` |
+| `current` | link to the active version |
+| `<User Library>/Remote Scripts/AbletonMCP` | link to `current/AbletonMCP_Remote_Script` |
+| `backups/` | anything that was in the way (e.g. a script installed by `ableton-mcp-install-script`) |
+| `state.json` | active and previous version, chosen Remote Scripts folder |
+
+A switch moves the `current` link only, after `uv sync` succeeded for the new version, so a version that fails to install never becomes active. Running `--ref` for an installed version again updates it; a version folder with local edits is not updated (use `--switch`).
+
+**One-time client setup.** Let your MCP client start the server from `current`:
+
+```bash
+python3 install.py --configure-claude-desktop   # edits claude_desktop_config.json after asking, keeps a .bak and your "env"
+python3 install.py --print-config               # snippets for Claude Desktop and Claude Code
+```
+
+The resulting server command is `uv run --frozen --directory ~/.dunk-ableton-mcp/current ableton-mcp`.
+
+**After every switch:** restart Ableton Live (or re-select AbletonMCP under Settings → Link, Tempo & MIDI) and restart your MCP client. `--status` shows whether Live already runs the new Remote Script.
+
+**Pull requests.** `--ref pr/N` installs code that may not be reviewed yet, and anyone can open a pull request on a public repository. The plan therefore shows a warning with the PR's author and whether it comes from a fork (looked up on the GitHub API; if that is not reachable, the warning says so). Only confirm a PR from someone you trust.
+
+**Windows and odd setups.** Links are symlinks; on Windows without Developer Mode the installer uses directory junctions, which need no admin rights. If the Remote Script cannot be linked it is copied instead (`--copy` forces this, `--link` switches back). If your User Library is not found, pass `--remote-scripts "<User Library>/Remote Scripts"` once; it is remembered.
+
+---
+
 ## Table of Contents
 
 - [Quickstart](#quickstart)
