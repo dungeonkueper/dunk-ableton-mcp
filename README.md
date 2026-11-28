@@ -301,6 +301,15 @@ The system uses a simple JSON-based protocol over TCP sockets:
 - The tool is designed to work with Ableton's default devices and browser items
 - Always save your work before extensive experimentation
 
+### Fork changelog (dungeonkueper/dunk-ableton-mcp)
+
+**Remote Script 1.9.0+dunk.1** (based on upstream 1.9.0; update the Remote Script together with the server)
+
+- New tool `create_return_track`, mapped to `Song.create_return_track()`. Like the Live API it takes no index: the return track is appended, and every track gets a new send for it. Safety category: `structure`.
+- New tool `set_send(track_index, send_index, value, track_type="track")`, mapped to `track.mixer_device.sends[send_index].value`. `send_index` equals the return track index (send A = 0). `value` uses Live's units (0.0–1.0); out-of-range values fail instead of being clamped. `track_type="return"` sets a return track's send to another return. Safety category: `mixer`. Upstream's guarded `set_track_mixer` can also set sends.
+- New tool `set_clip_automation(track_index, clip_index, points, parameter_type="device", ...)`, mapped to `Clip.automation_envelope` / `create_automation_envelope` and `AutomationEnvelope.insert_step`. Targets a device parameter (`device_index`, `parameter_index`), `volume`, `panning` or a `send` (`send_index`), on a Session clip or, with `clip_location="arrangement"`, an Arrangement clip. Ramps are approximated with steps of `resolution` beats (default 0.25). Values outside the parameter range are rejected. Safety category: `edit`.
+- New tool `clear_clip_automation`, mapped to `Clip.clear_envelope` (one parameter) or `Clip.clear_all_envelopes` (`parameter_type="all"`). Safety category: `delete`, which upstream's safety policy disables by default (enable it in `~/.config/ableton-mcp/safety.json`, as for `clear_notes_from_clip`).
+
 ---
 
 ## Telemetry

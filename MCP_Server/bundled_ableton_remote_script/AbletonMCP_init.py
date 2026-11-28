@@ -41,7 +41,7 @@ EXPECTED_COMMAND_ERRORS = (ValueError, IndexError)
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.9.0"
+SCRIPT_VERSION = "1.9.0+dunk.1"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
