@@ -56,6 +56,7 @@ class PreferenceSource(str, Enum):
 ACTION_CATEGORIES = {
     "create_midi_track": "create",
     "create_audio_track": "create",
+    "create_return_track": "create",
     "create_clip": "create",
     "create_audio_clip": "create",
     "set_track_name": "edit",
@@ -64,6 +65,9 @@ ACTION_CATEGORIES = {
     "add_notes_to_clip": "edit_midi",
     "set_tempo": "mix",
     "set_device_parameter": "mix",
+    "set_send": "mix",
+    "set_clip_automation": "mix",
+    "clear_clip_automation": "mix",
     "fire_clip": "transport",
     "stop_clip": "transport",
     "start_playback": "transport",

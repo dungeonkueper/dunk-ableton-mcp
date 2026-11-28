@@ -27,6 +27,7 @@ logger = logging.getLogger("ableton-mcp-dataset")
 MODIFYING_TOOLS = {
     "create_midi_track",
     "create_audio_track",
+    "create_return_track",
     "set_track_name",
     "create_clip",
     "create_audio_clip",
@@ -35,6 +36,9 @@ MODIFYING_TOOLS = {
     "set_arrangement_clip_name",
     "set_tempo",
     "set_device_parameter",
+    "set_send",
+    "set_clip_automation",
+    "clear_clip_automation",
     "load_instrument_or_effect",
     "load_drum_kit",
     "duplicate_to_arrangement",

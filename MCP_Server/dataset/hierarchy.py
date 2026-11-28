@@ -8,6 +8,9 @@ from typing import Any
 _TOOL_LEVELS: dict[str, tuple[int, str]] = {
     "set_tempo": (1, "adjust_tempo"),
     "set_device_parameter": (1, "adjust_parameter"),
+    "set_send": (1, "adjust_send"),
+    "set_clip_automation": (2, "write_automation"),
+    "clear_clip_automation": (2, "write_automation"),
     "set_track_name": (1, "rename_track"),
     "set_clip_name": (1, "rename_clip"),
     "set_arrangement_clip_name": (1, "rename_clip"),
@@ -19,6 +22,7 @@ _TOOL_LEVELS: dict[str, tuple[int, str]] = {
     "switch_to_arrangement_view": (1, "change_view"),
     "create_midi_track": (2, "create_track"),
     "create_audio_track": (2, "create_track"),
+    "create_return_track": (2, "create_track"),
     "create_clip": (2, "create_clip"),
     "create_audio_clip": (2, "create_clip"),
     "add_notes_to_clip": (2, "edit_midi"),

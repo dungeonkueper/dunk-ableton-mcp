@@ -53,10 +53,14 @@ _IMPLICIT_TRACKED_TOOLS = frozenset({
     "add_notes_to_clip",
     "create_midi_track",
     "create_audio_track",
+    "create_return_track",
     "load_instrument_or_effect",
     "load_drum_kit",
     "duplicate_to_arrangement",
     "set_device_parameter",
+    "set_send",
+    "set_clip_automation",
+    "clear_clip_automation",
 })
 
 # An edit undone within this many seconds reads as a rejection

@@ -9,6 +9,7 @@ import math
 import select
 import socket
 import json
+import math
 import threading
 import time
 import traceback
@@ -40,7 +41,7 @@ EXPECTED_COMMAND_ERRORS = (ValueError, IndexError)
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.9.0"
+SCRIPT_VERSION = "1.9.0+dunk.1"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -83,6 +84,10 @@ SCRIPT_CAPABILITIES = [
     "get_session_snapshot",
     "drain_passive_events",
     "set_device_parameter",
+    "create_return_track",
+    "set_send",
+    "set_clip_automation",
+    "clear_clip_automation",
 ]
 
 ROUTING_FIELDS = (("input_type", "input_routing_type"), ("input_channel", "input_routing_channel"),
@@ -220,9 +225,9 @@ def apply_changes(changes):
 # Safety categories adapted from PR #155; strict validation and host enforcement.
 SAFETY_CATEGORIES = ("delete", "playback", "mixer", "routing", "structure", "edit", "undo")
 SAFETY_COMMANDS = {
-    "delete": set(("delete_track", "delete_clip", "clear_notes_from_clip", "delete_device", "delete_scene", "remove_notes", "delete_arrangement_clip", "clear_drum_pad")),
+    "delete": set(("delete_track", "delete_clip", "clear_notes_from_clip", "delete_device", "delete_scene", "remove_notes", "delete_arrangement_clip", "clear_drum_pad", "clear_clip_automation")),
     "playback": set(("start_playback", "stop_playback", "fire_clip", "stop_clip", "fire_scene", "stop_all_clips", "jump_to_cue")),
-    "mixer": set(("set_track_mixer", "set_rack_chain")),
+    "mixer": set(("set_track_mixer", "set_rack_chain", "set_send")),
     "routing": set(("set_track_routing", "set_track_monitoring", "set_device_routing")),
     "structure": set(("create_midi_track", "create_audio_track", "create_clip", "create_audio_clip", "duplicate_track", "create_return_track", "create_scene", "duplicate_scene", "move_device", "load_browser_item", "load_instrument_or_effect", "map_rack_magnitude", "duplicate_session_clip_to_arrangement", "insert_device", "insert_rack_chain", "copy_drum_pad")),
     "undo": set(("undo", "redo")),
@@ -480,6 +485,82 @@ def step_sequencer_error(midi_clip_type):
             "are stored invisibly (not shown or played). Convert the clip to "
             "MIDI first." % (kind, midi_clip_type))
 
+
+# ── Clip automation (pure; no Live dependency so it can be unit-tested) ─────
+
+AUTOMATION_PARAMETER_TYPES = ("device", "volume", "panning", "send")
+# Finest step the tool writes (a 1/128 note) and the most steps per call, so
+# a typo in resolution cannot freeze Live's main thread.
+MIN_AUTOMATION_RESOLUTION = 0.03125
+MAX_AUTOMATION_STEPS = 4096
+
+
+def build_automation_steps(points, clip_length, lo, hi, resolution=0.25):
+    """Turn breakpoints into (time, duration, value) steps for insert_step.
+
+    The Live API writes clip envelopes only as steps
+    (AutomationEnvelope.insert_step), so a ramp between two breakpoints is
+    approximated by steps of ``resolution`` beats, each holding the linearly
+    interpolated value at its start. Two points at the same time make a jump.
+    The last point's value is held until the clip end.
+
+    points: list of {"time": beats from clip start, "value": parameter units},
+    times non-decreasing and within [0, clip_length]; values within [lo, hi].
+    Out-of-range input is rejected, never clamped.
+    """
+    if not isinstance(points, (list, tuple)) or not points:
+        raise ValueError("points must be a non-empty list of {time, value} objects")
+    if not (_is_number(resolution) and _is_finite(resolution)):
+        raise ValueError("resolution must be a finite number")
+    resolution = float(resolution)
+    if resolution < MIN_AUTOMATION_RESOLUTION:
+        raise ValueError("resolution must be >= %s beats, got %s"
+                         % (MIN_AUTOMATION_RESOLUTION, resolution))
+    clip_length = float(clip_length)
+    if clip_length <= 0:
+        raise ValueError("clip has no length")
+
+    parsed = []
+    for i, point in enumerate(points):
+        if not isinstance(point, dict):
+            raise ValueError("Invalid point at index %d: must be an object" % i)
+        t, v = point.get("time"), point.get("value")
+        for key, val in (("time", t), ("value", v)):
+            if not (_is_number(val) and _is_finite(val)):
+                raise ValueError("Invalid point at index %d: %s must be a "
+                                 "finite number, got %s" % (i, key, _short_repr(val)))
+        t, v = float(t), float(v)
+        if t < 0 or t > clip_length:
+            raise ValueError("Invalid point at index %d: time %s outside clip "
+                             "[0, %s]" % (i, t, clip_length))
+        if v < lo or v > hi:
+            raise ValueError("Invalid point at index %d: value %s out of range "
+                             "[%s, %s]" % (i, v, lo, hi))
+        if parsed and t < parsed[-1][0]:
+            raise ValueError("Invalid point at index %d: times must not "
+                             "decrease" % i)
+        parsed.append((t, v))
+
+    steps = []
+    for (t0, v0), (t1, v1) in zip(parsed, parsed[1:]):
+        span = t1 - t0
+        if span <= 0:
+            continue  # jump: the next segment starts at the new value
+        n = int(math.ceil(span / resolution - 1e-9))
+        for k in range(n):
+            t = t0 + k * resolution
+            v = v0 + (v1 - v0) * ((t - t0) / span)
+            dur = min(resolution, t1 - t)
+            steps.append((t, dur, v))
+            if len(steps) > MAX_AUTOMATION_STEPS:
+                raise ValueError(
+                    "automation needs more than %d steps; use a coarser "
+                    "resolution" % MAX_AUTOMATION_STEPS)
+    # Hold the final value to the clip end in one step.
+    last_t, last_v = parsed[-1]
+    if clip_length - last_t > 1e-9:
+        steps.append((last_t, clip_length - last_t, last_v))
+    return steps
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -1031,6 +1112,38 @@ class AbletonMCP(ControlSurface):
                 name = params.get("name", "")
                 time_val = params.get("time", 0.0)
                 response["result"] = self._create_locator(name, time_val)
+            elif command_type == "create_return_track":
+                response["result"] = self._create_return_track()
+            elif command_type == "set_send":
+                response["result"] = self._set_send(
+                    params.get("track_index", 0),
+                    params.get("send_index", 0),
+                    params.get("value", 0.0),
+                    params.get("track_type", "track"),
+                )
+            elif command_type == "set_clip_automation":
+                response["result"] = self._set_clip_automation(
+                    params.get("track_index", 0),
+                    params.get("clip_index", 0),
+                    params.get("points"),
+                    params.get("parameter_type", "device"),
+                    params.get("device_index"),
+                    params.get("parameter_index"),
+                    params.get("send_index"),
+                    params.get("clip_location", "session"),
+                    params.get("resolution", 0.25),
+                    params.get("clear_existing", True),
+                )
+            elif command_type == "clear_clip_automation":
+                response["result"] = self._clear_clip_automation(
+                    params.get("track_index", 0),
+                    params.get("clip_index", 0),
+                    params.get("parameter_type", "all"),
+                    params.get("device_index"),
+                    params.get("parameter_index"),
+                    params.get("send_index"),
+                    params.get("clip_location", "session"),
+                )
 
             elif command_type == "get_browser_item":
                 uri = params.get("uri", None)
@@ -2124,6 +2237,238 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error creating audio track: " + str(e))
             raise
 
+    def _create_return_track(self):
+        """Append a return track via Song.create_return_track().
+
+        The Live API takes no index: return tracks are always added after the
+        existing ones, and every track (including the other returns) gets a
+        new send for it, at the end of mixer_device.sends.
+        """
+        try:
+            self._song.create_return_track()
+            new_index = len(self._song.return_tracks) - 1
+            new_track = self._song.return_tracks[new_index]
+            return {
+                "index": new_index,
+                "name": str(new_track.name),
+                "send_index": new_index,
+                "return_track_count": len(self._song.return_tracks),
+            }
+        except Exception as e:
+            self.log_message("Error creating return track: " + str(e))
+            raise
+
+    def _set_send(self, track_index, send_index, value, track_type="track"):
+        """Set track.mixer_device.sends[send_index].value.
+
+        send_index matches the index into Song.return_tracks (send A = 0).
+        track_type selects Song.tracks ("track") or Song.return_tracks
+        ("return"). The value is in the send parameter's own units (0.0-1.0
+        in Live, -inf dB to 0 dB); out-of-range values are rejected,
+        not clamped.
+        """
+        try:
+            if track_type == "track":
+                tracks = self._song.tracks
+            elif track_type == "return":
+                tracks = self._song.return_tracks
+            else:
+                raise ValueError(
+                    "track_type must be 'track' or 'return', got %s"
+                    % _short_repr(track_type))
+            if isinstance(track_index, bool) or not isinstance(track_index, int):
+                raise ValueError("track_index must be an integer")
+            if isinstance(send_index, bool) or not isinstance(send_index, int):
+                raise ValueError("send_index must be an integer")
+            if track_index < 0 or track_index >= len(tracks):
+                raise IndexError("Track index out of range")
+            track = tracks[track_index]
+            sends = list(track.mixer_device.sends)
+            if send_index < 0 or send_index >= len(sends):
+                raise IndexError(
+                    "Send index %d out of range (track has %d send(s))"
+                    % (send_index, len(sends)))
+            if not (_is_number(value) and _is_finite(value)):
+                raise ValueError("value must be a finite number")
+            send = sends[send_index]
+            lo, hi = float(send.min), float(send.max)
+            value = float(value)
+            if value < lo or value > hi:
+                raise ValueError(
+                    "value %s out of range [%s, %s]" % (value, lo, hi))
+            if not getattr(send, "is_enabled", True):
+                raise RuntimeError(
+                    "Send %d on this track is disabled and cannot be changed"
+                    % send_index)
+            old = float(send.value)
+            send.value = value
+            return_name = None
+            try:
+                return_name = str(self._song.return_tracks[send_index].name)
+            except Exception:
+                pass
+            return {
+                "track_type": track_type,
+                "track_index": track_index,
+                "track_name": str(track.name),
+                "send_index": send_index,
+                "send_name": str(getattr(send, "name", "Send %d" % send_index)),
+                "return_track_name": return_name,
+                "old_value": old,
+                "value": float(send.value),
+                "min": lo,
+                "max": hi,
+            }
+        except Exception as e:
+            self.log_message("Error setting send: " + str(e))
+            raise
+
+    # ── Clip automation ──────────────────────────────────────────────────
+
+    def _resolve_automation_clip(self, track_index, clip_index, clip_location):
+        """Return (track, clip) for a Session slot or an Arrangement clip."""
+        for name, val in (("track_index", track_index), ("clip_index", clip_index)):
+            if isinstance(val, bool) or not isinstance(val, int):
+                raise ValueError("%s must be an integer" % name)
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+        track = self._song.tracks[track_index]
+        if clip_location == "session":
+            slots = list(track.clip_slots)
+            if clip_index < 0 or clip_index >= len(slots):
+                raise IndexError("Clip index out of range")
+            if not slots[clip_index].has_clip:
+                raise ValueError("No clip in slot %d" % clip_index)
+            return track, slots[clip_index].clip
+        if clip_location == "arrangement":
+            clips = list(track.arrangement_clips)
+            if clip_index < 0 or clip_index >= len(clips):
+                raise IndexError(
+                    "Arrangement clip index out of range (track has %d)"
+                    % len(clips))
+            return track, clips[clip_index]
+        raise ValueError("clip_location must be 'session' or 'arrangement', "
+                         "got %s" % _short_repr(clip_location))
+
+    def _resolve_automation_parameter(self, track, parameter_type,
+                                      device_index=None, parameter_index=None,
+                                      send_index=None):
+        """Return (DeviceParameter, label) on ``track``."""
+        if parameter_type not in AUTOMATION_PARAMETER_TYPES:
+            raise ValueError("parameter_type must be one of %s, got %s"
+                             % (", ".join(AUTOMATION_PARAMETER_TYPES),
+                                _short_repr(parameter_type)))
+        mixer = track.mixer_device
+        if parameter_type == "volume":
+            return mixer.volume, "Volume"
+        if parameter_type == "panning":
+            return mixer.panning, "Pan"
+        if parameter_type == "send":
+            if isinstance(send_index, bool) or not isinstance(send_index, int):
+                raise ValueError("send_index must be an integer for parameter_type 'send'")
+            sends = list(mixer.sends)
+            if send_index < 0 or send_index >= len(sends):
+                raise IndexError("Send index %d out of range (track has %d send(s))"
+                                 % (send_index, len(sends)))
+            return sends[send_index], "Send %s" % str(getattr(
+                sends[send_index], "name", send_index))
+        for name, val in (("device_index", device_index),
+                          ("parameter_index", parameter_index)):
+            if isinstance(val, bool) or not isinstance(val, int):
+                raise ValueError("%s must be an integer for parameter_type 'device'" % name)
+        devices = list(track.devices)
+        if device_index < 0 or device_index >= len(devices):
+            raise IndexError("Device index out of range")
+        device = devices[device_index]
+        params = list(device.parameters)
+        if parameter_index < 0 or parameter_index >= len(params):
+            raise IndexError("Parameter index out of range")
+        return params[parameter_index], "%s: %s" % (
+            str(device.name), str(params[parameter_index].name))
+
+    def _set_clip_automation(self, track_index, clip_index, points,
+                             parameter_type="device", device_index=None,
+                             parameter_index=None, send_index=None,
+                             clip_location="session", resolution=0.25,
+                             clear_existing=True):
+        """Write a clip envelope (Clip.automation_envelope / insert_step).
+
+        Point times are beats from the clip start, the same time base as
+        note start_time. Ramps are written as steps of ``resolution`` beats.
+        """
+        try:
+            track, clip = self._resolve_automation_clip(
+                track_index, clip_index, clip_location)
+            param, label = self._resolve_automation_parameter(
+                track, parameter_type, device_index, parameter_index, send_index)
+            lo, hi = float(param.min), float(param.max)
+            steps = build_automation_steps(points, clip.length, lo, hi, resolution)
+
+            if clear_existing:
+                clip.clear_envelope(param)
+            envelope = clip.automation_envelope(param)
+            if envelope is None:
+                envelope = clip.create_automation_envelope(param)
+            if envelope is None:
+                raise RuntimeError(
+                    "Live cannot create an envelope for '%s' on this clip" % label)
+            for t, dur, v in steps:
+                envelope.insert_step(t, dur, v)
+
+            check = []
+            for point in points:
+                t = float(point["time"])
+                if t < float(clip.length):
+                    try:
+                        check.append({"time": t,
+                                      "value": float(envelope.value_at_time(t))})
+                    except Exception:
+                        pass
+            return {
+                "track_index": track_index,
+                "track_name": str(track.name),
+                "clip_index": clip_index,
+                "clip_location": clip_location,
+                "clip_name": str(clip.name),
+                "clip_length": float(clip.length),
+                "parameter": label,
+                "min": lo,
+                "max": hi,
+                "step_count": len(steps),
+                "resolution": float(resolution),
+                "cleared_existing": bool(clear_existing),
+                "check": check,
+            }
+        except Exception as e:
+            self.log_message("Error setting clip automation: " + str(e))
+            raise
+
+    def _clear_clip_automation(self, track_index, clip_index,
+                               parameter_type="all", device_index=None,
+                               parameter_index=None, send_index=None,
+                               clip_location="session"):
+        """Clip.clear_envelope(param), or clear_all_envelopes() for 'all'."""
+        try:
+            track, clip = self._resolve_automation_clip(
+                track_index, clip_index, clip_location)
+            if parameter_type == "all":
+                clip.clear_all_envelopes()
+                label = "all"
+            else:
+                param, label = self._resolve_automation_parameter(
+                    track, parameter_type, device_index, parameter_index,
+                    send_index)
+                clip.clear_envelope(param)
+            return {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "clip_location": clip_location,
+                "clip_name": str(clip.name),
+                "cleared": label,
+            }
+        except Exception as e:
+            self.log_message("Error clearing clip automation: " + str(e))
+            raise
 
     def _set_track_name(self, track_index, name):
         """Set the name of a track"""

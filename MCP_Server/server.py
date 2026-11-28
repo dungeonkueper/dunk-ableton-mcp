@@ -128,7 +128,9 @@ class AbletonConnection:
             # Arrangement view commands
             "switch_to_arrangement_view", "set_current_song_time",
             "duplicate_session_clip_to_arrangement",
-            "create_locator"
+            "create_locator",
+            "create_return_track", "set_send",
+            "set_clip_automation", "clear_clip_automation",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -692,6 +694,240 @@ def create_audio_track(ctx: Context, index: int = -1, user_prompt: str = "") -> 
     except Exception as e:
         logger.error(f"Error creating audio track: {str(e)}")
         return f"Error creating audio track: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("create_return_track")
+@trajectory_tool("create_return_track")
+def create_return_track(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Create a new return track (Live API: Song.create_return_track()).
+
+    Like the Live API this takes no index: the return track is appended after
+    the existing ones, and every track gets a new send for it at the end of
+    its send list. The send index to use with set_send equals the new return
+    track's index (send A = 0, send B = 1, ...).
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("create_return_track")
+        if missing:
+            raise ToolError(missing)
+        ableton = get_ableton_connection()
+        result = ableton.send_command("create_return_track", {})
+        return (
+            f"Created return track '{result.get('name', 'unknown')}' "
+            f"(return index {result.get('index')}, use send_index "
+            f"{result.get('send_index')} with set_send)"
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating return track: {str(e)}")
+        raise ToolError(f"Error creating return track: {str(e)}") from e
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_send")
+@trajectory_tool("set_send")
+def set_send(
+    ctx: Context,
+    track_index: int,
+    send_index: int,
+    value: float,
+    track_type: str = "track",
+    user_prompt: str = "",
+) -> str:
+    """
+    Set a send level (Live API: track.mixer_device.sends[send_index].value).
+
+    send_index addresses the return track the send feeds: 0 = send A /
+    first return track, 1 = send B, and so on (see return_track_count in
+    get_session_info, or the "sends" list in get_session_snapshot).
+
+    Parameters:
+    - track_index: Index into Song.tracks, or into Song.return_tracks when
+      track_type is "return"
+    - send_index: Index into the track's sends (= return track index)
+    - value: Send level in Live's parameter units, 0.0 (-inf dB) to 1.0
+      (0 dB). Out-of-range values are rejected, not clamped.
+    - track_type: "track" (default) for a regular track, "return" to set a
+      return track's send to another return track
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("set_send")
+        if missing:
+            raise ToolError(missing)
+        ableton = get_ableton_connection()
+        result = ableton.send_command(
+            "set_send",
+            {
+                "track_index": track_index,
+                "send_index": send_index,
+                "value": value,
+                "track_type": track_type,
+            },
+        )
+        target = result.get("return_track_name") or result.get(
+            "send_name", f"send {send_index}")
+        return (
+            f"Set send '{result.get('send_name', send_index)}' on "
+            f"'{result.get('track_name', track_index)}' → '{target}': "
+            f"{result.get('old_value')} → {result.get('value')}"
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        logger.error(f"Error setting send: {str(e)}")
+        raise ToolError(f"Error setting send: {str(e)}") from e
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_clip_automation")
+@trajectory_tool("set_clip_automation")
+def set_clip_automation(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    points: list[dict],
+    parameter_type: str = "device",
+    device_index: int | None = None,
+    parameter_index: int | None = None,
+    send_index: int | None = None,
+    clip_location: str = "session",
+    resolution: float = 0.25,
+    clear_existing: bool = True,
+    user_prompt: str = "",
+) -> str:
+    """
+    Write a clip envelope (automation) for one parameter, e.g. a filter sweep.
+
+    Live API: Clip.automation_envelope / create_automation_envelope and
+    AutomationEnvelope.insert_step. The envelope belongs to the clip, so it
+    plays with the clip and is copied along by duplicate_to_arrangement. For
+    a sweep across several arrangement clips, write one segment per clip
+    (clip_location="arrangement").
+
+    Ramps between points are written as steps of `resolution` beats holding
+    the linearly interpolated value (Live's API only writes steps). Two points
+    at the same time make a jump; the last value is held to the clip end.
+
+    Parameters:
+    - track_index: Index into Song.tracks
+    - clip_index: Session clip slot index, or the index from
+      get_arrangement_clips when clip_location is "arrangement"
+    - points: [{"time": beats from clip start, "value": parameter units}, ...]
+      with non-decreasing times inside the clip. Values outside the
+      parameter's min/max are rejected (see get_device_parameters).
+    - parameter_type: "device" (needs device_index + parameter_index),
+      "volume", "panning" or "send" (needs send_index; 0 = send A)
+    - clip_location: "session" (default) or "arrangement"
+    - resolution: Step length in beats for ramps (default 0.25 = 1/16 note,
+      minimum 0.03125)
+    - clear_existing: Remove this parameter's existing envelope first (default True)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("set_clip_automation")
+        if missing:
+            raise ToolError(missing)
+        ableton = get_ableton_connection()
+        result = ableton.send_command(
+            "set_clip_automation",
+            {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "points": points,
+                "parameter_type": parameter_type,
+                "device_index": device_index,
+                "parameter_index": parameter_index,
+                "send_index": send_index,
+                "clip_location": clip_location,
+                "resolution": resolution,
+                "clear_existing": clear_existing,
+            },
+        )
+        check = ", ".join(
+            f"{c.get('time')}: {round(float(c.get('value', 0)), 4)}"
+            for c in result.get("check", [])
+        )
+        return (
+            f"Wrote automation for '{result.get('parameter', parameter_type)}' "
+            f"on {result.get('clip_location', clip_location)} clip "
+            f"'{result.get('clip_name', clip_index)}' "
+            f"({result.get('step_count')} steps over "
+            f"{result.get('clip_length')} beats)"
+            + (f"; envelope at points: {check}" if check else "")
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        logger.error(f"Error setting clip automation: {str(e)}")
+        raise ToolError(f"Error setting clip automation: {str(e)}") from e
+
+
+@mcp.tool()
+@rich_telemetry_tool("clear_clip_automation")
+@trajectory_tool("clear_clip_automation")
+def clear_clip_automation(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    parameter_type: str = "all",
+    device_index: int | None = None,
+    parameter_index: int | None = None,
+    send_index: int | None = None,
+    clip_location: str = "session",
+    user_prompt: str = "",
+) -> str:
+    """
+    Remove clip envelopes (Live API: Clip.clear_envelope / clear_all_envelopes).
+
+    Parameters:
+    - track_index, clip_index, clip_location: as in set_clip_automation
+    - parameter_type: "all" (default, every envelope in the clip), or
+      "device" / "volume" / "panning" / "send" with the same extra indices
+      as set_clip_automation to clear one parameter
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("clear_clip_automation")
+        if missing:
+            raise ToolError(missing)
+        ableton = get_ableton_connection()
+        result = ableton.send_command(
+            "clear_clip_automation",
+            {
+                "track_index": track_index,
+                "clip_index": clip_index,
+                "parameter_type": parameter_type,
+                "device_index": device_index,
+                "parameter_index": parameter_index,
+                "send_index": send_index,
+                "clip_location": clip_location,
+            },
+        )
+        return (
+            f"Cleared automation ({result.get('cleared', parameter_type)}) on "
+            f"{result.get('clip_location', clip_location)} clip "
+            f"'{result.get('clip_name', clip_index)}'"
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        logger.error(f"Error clearing clip automation: {str(e)}")
+        raise ToolError(f"Error clearing clip automation: {str(e)}") from e
 
 
 @mcp.tool()
