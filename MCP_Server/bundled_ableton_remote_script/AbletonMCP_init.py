@@ -113,6 +113,18 @@ INTEGRATION_COMMANDS = {
     "get_mixer_state": ("_cmd_get_mixer_state", False),
     "set_track_mixer": ("_cmd_set_track_mixer", True),
 }
+# Device registry (fork prototype): a read-only scan that the MCP server caches
+# locally per device class + Live version, and one guarded batch write.
+REGISTRY_COMMANDS = {
+    "scan_device": ("_cmd_scan_device", False),
+    "set_device_parameters": ("_cmd_set_device_parameters", True),
+}
+INTEGRATION_COMMANDS.update(REGISTRY_COMMANDS)
+MAX_SCAN_PARAMETERS = 512
+MAX_SCAN_SAMPLE_POINTS = 33
+MAX_SCAN_STR_CALLS = 8192
+MAX_SCAN_VALUE_ITEMS = 128
+MAX_BATCH_PARAMETER_CHANGES = 64
 SCRIPT_CAPABILITIES += sorted(INTEGRATION_COMMANDS)
 
 # Queue bounds limit the work accepted and executed during one Live callback.
@@ -1599,6 +1611,110 @@ class AbletonMCP(ControlSurface):
                  else self._value_for_display(parameter, params["display_value"]))
         if getattr(parameter, "is_quantized", False) and value != int(value): raise ValueError("Quantized value must be an integer")
         return self._transaction([(parameter, "value", value)], lambda: self._parameter_report(parameter))
+
+    def _live_version(self):
+        try:
+            app = self.application()
+            return "%d.%d.%d" % (int(app.get_major_version()), int(app.get_minor_version()),
+                                 int(app.get_bugfix_version()))
+        except Exception:
+            return None
+
+    def _cmd_scan_device(self, params):
+        """Read-only parameter scan for the server-side device registry.
+
+        str_for_value() only formats a value; nothing is written. Continuous
+        parameters get evenly spaced (value, display) samples so the server can
+        learn units and real-unit ranges once and cache them.
+        """
+        if set(params) - {"track_index", "track_type", "device_path", "device_index", "sample_points"}:
+            raise ValueError("Unknown scan_device field")
+        points = params.get("sample_points", 0)
+        if isinstance(points, bool) or not isinstance(points, int) or not (points == 0 or 2 <= points <= MAX_SCAN_SAMPLE_POINTS):
+            raise ValueError("sample_points must be 0 or 2..%d" % MAX_SCAN_SAMPLE_POINTS)
+        track, kind, index = self._resolve_track(params)
+        _, device, path = self._resolve_device(params)
+        parameters = list(device.parameters)
+        budget = [MAX_SCAN_STR_CALLS]
+        records = []
+        for i, param in enumerate(parameters[:MAX_SCAN_PARAMETERS]):
+            low, high = float(param.min), float(param.max)
+            quantized = bool(getattr(param, "is_quantized", False))
+            rec = {"index": i, "name": str(param.name), "parameter_id": self._identity_for(param),
+                   "original_name": str(getattr(param, "original_name", param.name)),
+                   "min": low, "max": high, "is_quantized": quantized,
+                   "is_enabled": bool(getattr(param, "is_enabled", True))}
+            try:
+                rec["value"] = finite_number(param.value, "parameter value")
+            except ValueError:
+                rec["value"] = None
+            default = getattr(param, "default_value", None)
+            if isinstance(default, (int, float)) and not isinstance(default, bool) and math.isfinite(default):
+                rec["default"] = float(default)
+            formatter = getattr(param, "str_for_value", None)
+            if quantized:
+                try:
+                    items = [str(item) for item in list(param.value_items)[:MAX_SCAN_VALUE_ITEMS]]
+                except Exception:
+                    items = []
+                rec["value_items"] = items
+            elif points and callable(formatter) and budget[0] >= points and high > low:
+                budget[0] -= points
+                rec["samples"] = [[low + (high - low) * k / float(points - 1),
+                                   str(formatter(low + (high - low) * k / float(points - 1)))] for k in range(points)]
+            if callable(formatter) and rec["value"] is not None:
+                rec["display"] = str(formatter(rec["value"]))
+            records.append(rec)
+        return {
+            "track_index": index, "track_type": kind, "target_id": self._identity_for(track),
+            "device_path": path, "device_id": self._identity_for(device),
+            "class_name": str(device.class_name),
+            "class_display_name": str(getattr(device, "class_display_name", device.class_name)),
+            "name": str(getattr(device, "name", "")), "live_version": self._live_version(),
+            "parameter_count": len(parameters), "parameters": records,
+            "parameters_truncated": len(parameters) > MAX_SCAN_PARAMETERS,
+            "samples_truncated": budget[0] < 0 or any(
+                points and not r["is_quantized"] and "samples" not in r and r["max"] > r["min"] for r in records),
+        }
+
+    def _cmd_set_device_parameters(self, params):
+        """Guarded batch write: every change is preflighted, then applied and
+        verified together (one command, so one undo step)."""
+        if set(params) - {"track_index", "track_type", "target_id", "expected_track_name", "device_path",
+                          "device_index", "device_id", "expected_class", "changes"}:
+            raise ValueError("Unknown device edit field")
+        track, device, path = self._resolve_device(params, True)
+        changes = params.get("changes")
+        if not isinstance(changes, list) or not changes or len(changes) > MAX_BATCH_PARAMETER_CHANGES:
+            raise ValueError("changes must be a list of 1..%d parameter changes" % MAX_BATCH_PARAMETER_CHANGES)
+        parameters = device.parameters
+        planned, seen = [], set()
+        for change in changes:
+            if not isinstance(change, dict) or set(change) - {"parameter_index", "parameter_id", "expected_name", "value", "display_value"}:
+                raise ValueError("Unknown parameter change field")
+            index = strict_index(change.get("parameter_index"), "parameter_index", len(parameters))
+            if index in seen:
+                raise ValueError("Parameter %d changed twice in one batch" % index)
+            seen.add(index)
+            parameter = parameters[index]
+            if change.get("parameter_id") is None and change.get("expected_name") is None:
+                raise CommandFailure("identity_required", "Give parameter_id or expected_name for each change")
+            self._check_identity(parameter, change.get("parameter_id"))
+            if change.get("expected_name") is not None and str(parameter.name) != change["expected_name"]:
+                raise CommandFailure("stale_target", "Parameter %d is no longer named %r" % (index, change["expected_name"]))
+            if not getattr(parameter, "is_enabled", True):
+                raise ValueError("Parameter %r is disabled" % str(parameter.name))
+            if ("value" in change) == ("display_value" in change):
+                raise ValueError("Give exactly one of value or display_value")
+            value = (finite_number(change["value"], "parameter", parameter.min, parameter.max) if "value" in change
+                     else self._value_for_display(parameter, change["display_value"]))
+            if getattr(parameter, "is_quantized", False) and value != int(value):
+                raise ValueError("Quantized value must be an integer")
+            planned.append((index, parameter, value))
+        def report():
+            return {"device_path": path, "device_id": self._identity_for(device), "class_name": str(device.class_name),
+                    "changed": [dict(self._parameter_report(p), parameter_index=i, name=str(p.name)) for i, p, _ in planned]}
+        return self._transaction([(p, "value", v) for _, p, v in planned], report)
 
     def _cmd_get_rack(self, params):
         _, rack, path = self._resolve_device(params)
