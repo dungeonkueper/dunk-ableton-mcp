@@ -58,13 +58,17 @@ def make_device():
 
 @pytest.fixture
 def live(monkeypatch, tmp_path):
+    return make_live(monkeypatch, tmp_path)
+
+
+def make_live(monkeypatch, tmp_path, device=None):
     (tmp_path / "safety.json").write_text("{}")
     monkeypatch.setenv("ABLETON_MCP_SAFETY_CONFIG", str(tmp_path / "safety.json"))
     rs = _load_script_module()
     app = types.SimpleNamespace(get_major_version=lambda: 12, get_minor_version=lambda: 4,
                                 get_bugfix_version=lambda: 5)
     inst = make_instance(rs, application=app)
-    device = make_device()
+    device = device or make_device()
     track = types.SimpleNamespace(name="Bass", devices=[device])
     inst._song = types.SimpleNamespace(tracks=[track], return_tracks=[], master_track=track, file_path="")
     calls = []
