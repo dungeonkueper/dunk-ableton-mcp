@@ -227,6 +227,10 @@ If you've moved your User Library, use its actual location (shown in Live under 
 
 The MCP server and Remote Script share a version handshake (`get_remote_script_info`). If they diverge, newer tools degrade gracefully until Live is restarted.
 
+Remote Script 1.7.2 routes both reads and writes through a bounded queue processed by Live's `update_display` callback on the main thread. It accepts at most 64 pending commands and processes up to eight per callback. Requests normally time out after 10 seconds; audio-file imports have 60 seconds. Commands cancelled or expired while pending are skipped. If an operation already started when its request times out, the error reports an unknown outcome: inspect Live's state before repeating a write. Disconnecting the control surface cancels pending requests and closes client sockets.
+
+`get_track_info`, `get_session_info`'s master track, and regular, return, and master tracks in `get_session_snapshot` include `output_meter_left`, `output_meter_right`, and `output_meter_level`. These are read-only values from the [Live Track API](https://docs.cycling74.com/apiref/lom/track/), in the range 0.0 to 1.0. Left/right values are momentary smoothed peaks for tracks with audio output; `output_meter_level` is the held peak for audio or MIDI output. Missing, unsupported, or invalid values are `null`, so unavailable meters are distinguishable from silence. These values are sampled on request; they do not measure rendered audio samples or provide continuous metering. The existing TCP request/response format and snapshot schema remain compatible.
+
 ---
 
 ## Usage
@@ -294,17 +298,6 @@ The system uses a simple JSON-based protocol over TCP sockets:
 - Creating complex musical arrangements might need to be broken down into smaller steps
 - The tool is designed to work with Ableton's default devices and browser items
 - Always save your work before extensive experimentation
-- **Live 13 Step Sequencer clips are not supported.** The Live API accepts notes written into a Step Sequencer clip but never shows or plays them, and it does not expose the clip's steps. `add_notes_to_clip` and `clear_notes_from_clip` therefore refuse any clip whose `midi_clip_type` is not 0 (convert the clip to MIDI first). `get_clip_notes`, `get_track_info` and session snapshots report `midi_clip_type`; for such clips `notes_may_not_match_ui` is `true`.
-
-### Changelog
-
-**Remote Script 1.8.0** (update the Remote Script together with the server)
-
-- `add_notes_to_clip` writes through `clip.add_new_notes()` (Live 11+), so `probability`, `velocity_deviation` and `release_velocity` are stored instead of being dropped. Defaults: `probability` 1.0, `velocity_deviation` 0.0, `release_velocity` 64. Older Live versions fall back to `set_notes()`; the result reports `api_used` and lists any fields that could not be stored.
-- Notes are validated before anything is written (pitch 0–127, velocity 1–127, probability 0–1, velocity_deviation −127–127, release_velocity 0–127, duration > 0). Invalid values fail the call; nothing is clamped.
-- Writing to or clearing a Live 13 Step Sequencer clip (`midi_clip_type != 0`) fails with an error and leaves the clip unchanged. The check fails closed: only a missing `midi_clip_type` property (Live ≤ 12) counts as a normal clip; if the property exists but cannot be read or holds an unexpected value, writes are refused and readers report `midi_clip_type_error` with `notes_may_not_match_ui: true`.
-- Readers return `midi_clip_type` and `notes_may_not_match_ui`.
-- `add_notes_to_clip` and `clear_notes_from_clip` report failures as tool errors instead of success text, and an error reply from the Remote Script no longer drops the connection.
 
 ---
 
@@ -380,3 +373,17 @@ This is a third-party integration and not made by Ableton. Made by [Siddharth](h
 **If Ableton MCP is useful to you, consider starring the repo**
 
 </div>
+
+Session metadata includes `root_note`, `scale_name`, and project `name`. Missing or unsupported key/scale properties return `null`; an unavailable name returns `Untitled`. These properties are detected at runtime.
+
+### Optional audio capture and analysis
+
+Install `ableton-mcp[audio]` for NumPy-based WAV analysis. Core startup does not require scientific libraries. Capture currently supports macOS avfoundation only and requires ffmpeg plus an explicitly configured loopback input such as BlackHole 2ch. Route Live's output to the loopback device using Audio MIDI Setup; capture does not start playback or change routing. Windows/Linux capture is unsupported.
+
+`record_audio` records at most 30 seconds. Analysis accepts temporary 16-bit WAVs up to 120 seconds, 8 channels and 4 million samples, whichever limit is reached first. Recording and analysis run off the event loop. Failed/cancelled captures clean their owned temporary output; successful recordings last until analysis or server shutdown. Existing output paths are never overwritten. Real capture support remains unverified until tested with the user's configured loopback device.
+
+### Offline analysis and MIDI previews
+
+Install `ableton-mcp[analysis]` to enable `analyze_audio_file` (NumPy, SciPy and soundfile). It reads an existing file without rendering or changing Live. Limits are 128 MiB per file, 120 seconds per selected segment, 6 million decoded samples and 8 channels. Loudness/spectrum measurements are reported separately from heuristic tempo, tonality and mix advice.
+
+`preview_midi_transform` needs no scientific extras and never accesses Live. It returns transformed copies of at most 10000 supplied notes, preserving extended metadata/IDs. Supported operations are transpose, scale, quantize, swing, offsets, velocity shaping, articulation and deterministic humanization. It does not clear, replace or write a clip.

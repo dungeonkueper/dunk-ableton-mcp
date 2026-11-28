@@ -65,7 +65,7 @@ def test_unknown_keys_like_note_id_are_ignored(rs):
 
 def test_boundary_values_are_accepted(rs):
     specs = rs.normalize_note_specs([
-        {"pitch": 0, "velocity": 1, "probability": 0, "release_velocity": 0,
+        {"pitch": 0, "velocity": 0, "probability": 0, "release_velocity": 0,
          "velocity_deviation": -127},
         {"pitch": 127, "velocity": 127, "probability": 1, "release_velocity": 127,
          "velocity_deviation": 127},
@@ -90,7 +90,7 @@ def test_boundary_values_are_accepted(rs):
     ({"pitch": 10 ** 5000}, "pitch"),  # repr() itself fails on 3.11+
     ({"pitch": 60, "start_time": 10 ** 400}, "start_time"),
     ({"pitch": 60, "velocity": -10 ** 400}, "velocity"),
-    ({"pitch": 60, "velocity": 0}, "velocity"),
+    ({"pitch": 60, "velocity": -1}, "velocity"),
     ({"pitch": 60, "velocity": 128}, "velocity"),
     ({"pitch": 60, "probability": 1.1}, "probability"),
     ({"pitch": 60, "probability": -0.1}, "probability"),
@@ -383,7 +383,7 @@ def test_script_error_keeps_connection_and_message():
 # --------------------------------------------------------------------------
 
 def test_script_and_server_versions_match(rs):
-    assert rs.SCRIPT_VERSION == EXPECTED_REMOTE_SCRIPT_VERSION == "1.8.0"
+    assert rs.SCRIPT_VERSION == EXPECTED_REMOTE_SCRIPT_VERSION
 
 
 # --------------------------------------------------------------------------
@@ -441,3 +441,20 @@ def test_missing_property_still_means_live12_normal_clip(rs, fake_live):
     result = make_script(rs, clip)._add_notes_to_clip(0, 0, [NOTE])
     assert result["midi_clip_type"] is None
     assert len(clip.notes) == 1
+
+
+@pytest.mark.parametrize("modern", [False, True])
+def test_zero_velocity_is_valid_and_preserved(rs, fake_live, modern):
+    clip = FakeClip(modern=modern)
+    make_script(rs, clip)._add_notes_to_clip(0, 0, [{"pitch": 60, "velocity": 0}])
+    if modern:
+        assert clip.notes[0]["velocity"] == 0
+    else:
+        assert clip.legacy_writes[0][3] == 0
+
+
+def test_note_count_limit_checked_before_writes(rs, fake_live):
+    clip = FakeClip()
+    with pytest.raises(ValueError, match="10000"):
+        make_script(rs, clip)._add_notes_to_clip(0, 0, [{"pitch": 60}] * 10001)
+    assert clip.notes == [] and clip.legacy_writes == []

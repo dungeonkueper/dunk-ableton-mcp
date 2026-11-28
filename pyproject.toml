@@ -1,6 +1,6 @@
 [project]
 name = "ableton-mcp"
-version = "1.4.5"
+version = "1.5.0"
 description = "Ableton Live integration through the Model Context Protocol"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,6 +18,10 @@ dependencies = [
     "supabase>=2.0.0",
 ]
 
+[project.optional-dependencies]
+audio = ["numpy>=1.24"]
+analysis = ["numpy>=1.24", "scipy>=1.10", "soundfile>=0.12"]
+
 [project.scripts]
 ableton-mcp = "MCP_Server.server:main"
 ableton-mcp-install-script = "MCP_Server.remote_script_install:main"
@@ -27,7 +31,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["MCP_Server", "MCP_Server.dataset", "MCP_Server.bundled_ableton_remote_script"]
+packages = ["MCP_Server.ears", "MCP_Server", "MCP_Server.dataset", "MCP_Server.bundled_ableton_remote_script"]
 # MANIFEST.in governs the sdist; this governs the wheel. Both are needed.
 exclude-package-data = { "MCP_Server" = ["config.py"] }
 

@@ -2,6 +2,8 @@
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.fastmcp.exceptions import ToolError
 import socket
+import asyncio
+from . import audio
 import json
 import logging
 import os
@@ -24,11 +26,11 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("AbletonMCPServer")
 
 class AbletonCommandError(Exception):
-    """The Remote Script received the command and reported an error.
+    """A valid command error response; the socket remains usable."""
 
-    The connection itself is fine, so it is kept open, and the script's
-    message is passed on as-is rather than as a communication failure.
-    """
+    def __init__(self, message, error=None):
+        super().__init__(message)
+        self.error = error or {}
 
 
 @dataclass
@@ -56,7 +58,7 @@ class AbletonConnection:
             return True
         except Exception as e:
             logger.error(f"Failed to connect to Ableton at {self.host}:{self.port}: {str(e)}")
-            self.sock = None
+            self.disconnect()
             return False
     
     def disconnect(self):
@@ -71,51 +73,29 @@ class AbletonConnection:
                     self.sock = None
 
     def receive_full_response(self, sock, buffer_size=8192):
-        """Receive the complete response, potentially in multiple chunks"""
-        chunks = []
-        sock.settimeout(15.0)  # Increased timeout for operations that might take longer
-        
-        try:
-            while True:
-                try:
-                    chunk = sock.recv(buffer_size)
-                    if not chunk:
-                        if not chunks:
-                            raise Exception("Connection closed before receiving any data")
-                        break
-                    
-                    chunks.append(chunk)
-                    
-                    # Check if we've received a complete JSON object
-                    try:
-                        data = b''.join(chunks)
-                        json.loads(data.decode('utf-8'))
-                        logger.info(f"Received complete response ({len(data)} bytes)")
-                        return data
-                    except json.JSONDecodeError:
-                        # Incomplete JSON, continue receiving
-                        continue
-                except socket.timeout:
-                    logger.warning("Socket timeout during chunked receive")
-                    break
-                except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
-                    logger.error(f"Socket connection error during receive: {str(e)}")
-                    raise
-        except Exception as e:
-            logger.error(f"Error during receive: {str(e)}")
-            raise
-            
-        # If we get here, we either timed out or broke out of the loop
-        if chunks:
-            data = b''.join(chunks)
-            logger.info(f"Returning data after receive completion ({len(data)} bytes)")
+        """Receive one JSON response using the command's socket timeout."""
+        data = bytearray()
+        while True:
+            chunk = sock.recv(buffer_size)
+            if not chunk:
+                raise ConnectionError("Connection closed before receiving a complete response")
+            data.extend(chunk)
+
             try:
-                json.loads(data.decode('utf-8'))
-                return data
+                decoded = data.decode("utf-8")
+            except UnicodeDecodeError as e:
+                # A TCP chunk may end between the bytes of a UTF-8 character.
+                # Invalid bytes elsewhere are an error, not an incomplete frame.
+                if e.reason == "unexpected end of data" and e.end == len(data):
+                    continue
+                raise
+
+            try:
+                json.loads(decoded)
             except json.JSONDecodeError:
-                raise Exception("Incomplete JSON response received")
-        else:
-            raise Exception("No data received")
+                continue
+            logger.info("Received complete response (%d bytes)", len(data))
+            return bytes(data)
 
     def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """Send a command to Ableton and return the response.
@@ -181,28 +161,28 @@ class AbletonConnection:
 
             if response.get("status") == "error":
                 logger.error(f"Ableton error: {response.get('message')}")
-                raise AbletonCommandError(response.get("message", "Unknown error from Ableton"))
+                raise AbletonCommandError(response.get("message", "Unknown error from Ableton"), response.get("error"))
             
             return response.get("result", {})
         except AbletonCommandError:
             raise
         except socket.timeout:
             logger.error("Socket timeout while waiting for response from Ableton")
-            self.sock = None
+            self.disconnect()
             raise Exception("Timeout waiting for Ableton response")
         except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
             logger.error(f"Socket connection error: {str(e)}")
-            self.sock = None
+            self.disconnect()
             raise Exception(f"Connection to Ableton lost: {str(e)}")
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON response from Ableton: {str(e)}")
             if 'response_data' in locals() and response_data:
                 logger.error(f"Raw response (first 200 bytes): {response_data[:200]}")
-            self.sock = None
+            self.disconnect()
             raise Exception(f"Invalid response from Ableton: {str(e)}")
         except Exception as e:
             logger.error(f"Error communicating with Ableton: {str(e)}")
-            self.sock = None
+            self.disconnect()
             raise Exception(f"Communication error with Ableton: {str(e)}")
 
 @asynccontextmanager
@@ -367,6 +347,23 @@ def get_ableton_connection():
 # Core Tool endpoints
 
 @mcp.tool()
+@rich_telemetry_tool("get_locators")
+def get_locators(ctx: Context, user_prompt: str = "") -> str:
+    """List timeline locators with stable identities."""
+    return json.dumps(get_ableton_connection().send_command("get_locators", {}))
+
+
+@mcp.tool()
+@rich_telemetry_tool("get_target_identity")
+def get_target_identity(ctx: Context, track_index: int = 0, track_type: str = "track", clip_index: int = None, user_prompt: str = "") -> str:
+    """Read opaque target IDs before guarded edits; re-read after a stale-target error."""
+    params = {"track_index": track_index, "track_type": track_type}
+    if clip_index is not None:
+        params["clip_index"] = clip_index
+    return json.dumps(get_ableton_connection().send_command("get_target_identity", params))
+
+
+@mcp.tool()
 def set_dataset_consent(ctx: Context, consent: bool, user_said: str = "") -> str:
     """Record the user's answer to the dataset consent question.
 
@@ -493,6 +490,7 @@ def get_track_info(ctx: Context, track_index: int, user_prompt: str = "") -> str
         return f"Error getting track info: {str(e)}"
 
 
+
 @mcp.tool()
 @telemetry_tool("get_clip_notes")
 @trajectory_tool("get_clip_notes")
@@ -537,6 +535,7 @@ def get_clip_notes(
     except Exception as e:
         logger.error(f"Error getting clip notes: {str(e)}")
         return f"Error getting clip notes: {str(e)}"
+
 
 
 @mcp.tool()
@@ -788,7 +787,7 @@ def add_notes_to_clip(
     - pitch: integer 0..127
     - start_time: beats from clip start [0.0]
     - duration: beats, > 0 [0.25]
-    - velocity: 1..127 [100]
+    - velocity: 0..127 [100]
     - mute: boolean [false]
     - probability: 0.0..1.0 [1.0]
     - velocity_deviation: -127..127 [0.0]
@@ -842,6 +841,7 @@ def _format_add_notes_result(result, notes, track_index: int, clip_index: int) -
         )
     return text
 
+
 @mcp.tool()
 @rich_telemetry_tool("clear_notes_from_clip")
 def clear_notes_from_clip(
@@ -887,6 +887,7 @@ def clear_notes_from_clip(
     except Exception as e:
         logger.error(f"Error clearing notes from clip: {str(e)}")
         raise ToolError(f"Error clearing notes from clip: {str(e)}") from e
+
 
 @mcp.tool()
 @rich_telemetry_tool("set_clip_name")
@@ -1628,6 +1629,112 @@ def record_audition(
         logger.error(f"Error recording audition: {str(e)}")
         return f"Error recording audition: {str(e)}"
 
+
+
+from .integration_tools import register_tools as _register_integration_tools
+_register_integration_tools(mcp, get_ableton_connection)
+
+
+@mcp.tool()
+@telemetry_tool("record_audio")
+async def record_audio(ctx: Context, seconds: float = 4.0, device: str = audio.DEFAULT_DEVICE, user_prompt: str = "") -> str:
+    """
+    Record what Live is playing to a WAV file, so it can be analyzed with analyze_audio.
+
+    This only records; it does not start playback. Start playback first (start_playback
+    or fire_clip), and solo a track first if you want to hear just that track.
+    Capture begins about 0.5 s after the call, so start playback a little before the
+    part you want. Recording happens in real time, so keep it short (2-8 seconds is
+    usually enough). It runs in a worker thread, so other tools stay responsive.
+
+    Requires macOS, ffmpeg and a loopback device (BlackHole 2ch) that receives Live's
+    output through a Multi-Output Device. See the "Hearing your session" section of
+    the README.
+
+    Parameters:
+    - seconds: How long to record (max 30)
+    - device: Name of the loopback input to record from (default "BlackHole 2ch")
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        recording = asyncio.create_task(asyncio.to_thread(audio.record, seconds, device))
+        try:
+            path = await asyncio.shield(recording)
+        except asyncio.CancelledError:
+            def cleanup_finished(task):
+                if not task.cancelled() and task.exception() is None:
+                    audio.cleanup_recording(task.result())
+            recording.add_done_callback(cleanup_finished)
+            raise
+        return f"Recorded {seconds:g}s from '{device}' to {path}"
+    except Exception as e:
+        logger.error(f"Error recording audio: {str(e)}")
+        return f"Error recording audio: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("analyze_audio")
+async def analyze_audio(ctx: Context, path: str, user_prompt: str = "") -> str:
+    """
+    Analyze a WAV file recorded with record_audio.
+
+    Returns peak and RMS level (dBFS), crest factor, clipped sample count, stereo
+    balance and correlation (1 = mono, near 0 = wide, negative = phase problems),
+    and the share of energy in low (<250 Hz), mid (250 Hz-4 kHz) and high (>4 kHz)
+    bands. Use it to check levels, compare before/after a change, or spot a muddy
+    or harsh mix.
+
+    Parameters:
+    - path: The WAV path returned by record_audio (only files in the temp directory
+      are read, up to 120 seconds long)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        return json.dumps(await asyncio.to_thread(audio.analyze, path), indent=2, allow_nan=False)
+    except Exception as e:
+        logger.error(f"Error analyzing audio: {str(e)}")
+        return f"Error analyzing audio: {str(e)}"
+    finally:
+        audio.cleanup_recording(path)
+
+
+@mcp.tool()
+@telemetry_tool("analyze_audio_file")
+async def analyze_audio_file(ctx: Context, path: str, start_s: float = None, end_s: float = None, bpm: float = None, user_prompt: str = "") -> str:
+    """Offline file analysis: loudness, spectrum, stereo, estimated rhythm and tonality.
+
+    Requires optional analysis extras. Bounds: 128 MiB file, 120 seconds,
+    6 million decoded samples, 8 channels and 8..192 kHz. Does not render,
+    overwrite, install dependencies, or access Live. Interpret musical results
+    as heuristic estimates. Input file is never deleted.
+    """
+    try:
+        from .ears import analyze
+    except ImportError as error:
+        raise ToolError('Install ableton-mcp[analysis] to use offline audio analysis') from error
+    try:
+        result = await asyncio.to_thread(analyze, path, start_s=start_s, end_s=end_s, bpm=bpm)
+        return json.dumps(result, allow_nan=False)
+    except Exception as error:
+        raise ToolError(str(error)) from error
+
+
+@mcp.tool()
+@telemetry_tool("preview_midi_transform")
+async def preview_midi_transform(ctx: Context, notes: List[Dict[str, Any]], ops: Dict[str, Any], clip_length: float, user_prompt: str = "") -> str:
+    """Return a pure MIDI transformation preview without reading or writing Live.
+
+    At most 10000 notes. Supported ops: transpose, scale, quantize, swing,
+    offset, role_offsets, velocity, articulation and seeded humanize.
+    Preserves extended note metadata and IDs; returns new dictionaries.
+    Transformed timing wraps to the clip, pitch/velocity clamp to MIDI range.
+    """
+    from .midi_preview import transform_notes, describe_ops
+    try:
+        result = await asyncio.to_thread(transform_notes, notes, ops, clip_length)
+        return json.dumps({"preview_only": True, "notes": result, "description": describe_ops(ops)}, allow_nan=False)
+    except Exception as error:
+        raise ToolError(str(error)) from error
 
 
 # Main execution

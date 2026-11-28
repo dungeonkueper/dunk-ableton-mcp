@@ -73,3 +73,9 @@ local_tests/
 
 # Lock files (optional - uncomment if you don't want to track)
 # uv.lock
+
+# Local BB task artifacts
+/.bb/
+
+#Agents file
+/AGENTS.md
